@@ -1,0 +1,31 @@
+PhimoeForCausalLM(
+  (model): PhimoeModel(
+    (embed_tokens): Embedding(32064, 4096)
+    (layers): ModuleList(
+      (0-31): 32 x PhimoeDecoderLayer(
+        (self_attn): PhimoeSdpaAttention(
+          (q_proj): Linear(in_features=4096, out_features=4096, bias=True)
+          (k_proj): Linear(in_features=4096, out_features=1024, bias=True)
+          (v_proj): Linear(in_features=4096, out_features=1024, bias=True)
+          (o_proj): Linear(in_features=4096, out_features=4096, bias=True)
+        )
+        (block_sparse_moe): PhimoeSparseMoeBlock(
+          (gate): Linear(in_features=4096, out_features=16, bias=False)
+          (experts): ModuleList(
+            (0-15): 16 x PhimoeBlockSparseTop2MLP(
+              (w1): Linear(in_features=4096, out_features=6400, bias=False)
+              (w2): Linear(in_features=6400, out_features=4096, bias=False)
+              (w3): Linear(in_features=4096, out_features=6400, bias=False)
+              (act_fn): SiLU()
+            )
+          )
+        )
+        (input_layernorm): LayerNorm((4096,), eps=1e-05, elementwise_affine=True)
+        (post_attention_layernorm): LayerNorm((4096,), eps=1e-05, elementwise_affine=True)
+      )
+    )
+    (norm): LayerNorm((4096,), eps=1e-05, elementwise_affine=True)
+    (rotary_emb): PhimoeRotaryEmbedding()
+  )
+  (lm_head): Linear(in_features=4096, out_features=32064, bias=True)
+)

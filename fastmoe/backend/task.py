@@ -214,12 +214,17 @@ class Batch:
         
     
     def sample(self, logits: torch.Tensor):
-        # Post process logits
-        logits = logits.contiguous()
+        # Post process logits (cast to fp32 for numerical stability)
+        logits = logits.to(torch.float32).contiguous()
         logits.div_(self.temperatures)
         logits.add_(self.logit_bias)
 
+        # Stabilize softmax by subtracting max
+        logits = logits - logits.max(dim=-1, keepdim=True)[0]
         probs = torch.softmax(logits, dim=-1)
+
+        # Replace any NaN with zero
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
         probs_sort, probs_idx = _top_p_top_k(probs, self.top_ps, self.top_ks)
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
         batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(
@@ -239,5 +244,12 @@ def _top_p_top_k(probs: torch.Tensor, top_ps: torch.Tensor, top_ks: torch.Tensor
     probs_sort[
         torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1) >= top_ks
     ] = 0.0
-    probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
+    # avoid dividing by zero
+    max_vals = probs_sort.max(dim=-1, keepdim=True)[0]
+    zero_mask = max_vals == 0
+    max_vals = max_vals + zero_mask * 1.0  # set zeros to 1 to avoid nan
+    probs_sort.div_(max_vals)
+    # if entire row was zero, set first element to 1 (uniform fallback)
+    if zero_mask.any():
+        probs_sort[zero_mask.squeeze(-1), 0] = 1.0
     return probs_sort, probs_idx

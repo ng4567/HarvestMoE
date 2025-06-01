@@ -1,0 +1,7 @@
+Server Config:
+python -m fastmoe.serve.launch_server --model-path microsoft/Phi-3.5-MoE-instruct --port 30000 --cpu-mem-bdw 76 --avg-prompt-len 77 --gen-len 32
+
+Result:
+python bench.py --port 30000 --max-new-tokens 32 --ubs 324 --n-ub 14
+Time: 303.109s
+Throughput: 472.965 tokens/s
