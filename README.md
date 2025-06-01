@@ -1,3 +1,8 @@
+#Proper way to run, mixtral is broken:
+python -m fastmoe.serve.launch_server --model-path microsoft/Phi-3.5-MoE-instruct --port 30000 --cpu-mem-bdw 76 --avg-prompt-len 77 --gen-len 32
+
+
+
 # MoE-Lightning: Artifact Evaluation
 
 This document contains instruction for ASPLOS 2025 artifact evaluation for the paper *MoE-Lightning: High-Throughput MoE Inference on
