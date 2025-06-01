@@ -1,4 +1,4 @@
-#Proper way to run, mixtral is broken:
+# Proper way to run, mixtral is currently broken:
 python -m fastmoe.serve.launch_server --model-path microsoft/Phi-3.5-MoE-instruct --port 30000 --cpu-mem-bdw 76 --avg-prompt-len 77 --gen-len 32
 
 
