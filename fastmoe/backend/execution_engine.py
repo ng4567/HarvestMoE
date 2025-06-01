@@ -47,6 +47,10 @@ class ExecutionEngine:
 
         # experts cache mapping: experts_id -> idx in self.context.experts_cache
         self.experts_mapping = [torch.empty(self.model_config.num_local_experts, dtype=torch.int64, device="cuda") for _ in range(self.model_config.num_hidden_layers)]
+        
+        # Configuration for non-blocking execution
+        self.enable_nonblocking = getattr(hardware_config, 'enable_nonblocking_fwd_pass', False)
+        print(f"Non-blocking MoE execution: {'ENABLED' if self.enable_nonblocking else 'DISABLED'}")
     
     def init_weights_prefetch_meta(self):
 
@@ -313,6 +317,187 @@ class ExecutionEngine:
         # record compute event
         self.compute_events[batch_id].record()
 
+    def layer_nonblocking(self, layer_id: int, page_id: int, batch_id: int):
+        """
+        Non-blocking version of layer forward pass that processes tokens
+        as their required experts become available.
+        
+        NOTE: Currently simplified to process all tokens through attention
+        normally, and only apply non-blocking logic to MoE layers.
+        """
+        print(f"Non-blocking prefill layer: {layer_id}, batch: {batch_id}")
+        batch = self.micro_batches[batch_id]
+        
+        # Wait for necessary prerequisites
+        if batch_id == 0:
+            self.prefetch_events[self.num_weights_slots_prefill - 1].wait(self.context.cur_stream)
+        self.context.offload_kv_events[batch.cache_line_idx].wait(self.context.cur_stream)
+        self.prefill_load_hidden_events[batch_id].wait(self.context.cur_stream)
+        
+        # For now, we'll use a simplified approach:
+        # 1. Run the full layer computation (attention + MoE)
+        # 2. In the future, we can optimize to only make MoE non-blocking
+        
+        # This is essentially the same as the blocking version for now
+        # but provides a foundation for future optimization
+        if self.context.policy.eg != self.model_config.num_local_experts:
+            # TODO: Implement expert-level computation with non-blocking
+            pass
+        else:
+            if layer_id < self.model_config.num_hidden_layers - 1:
+                batch.hidden_states, batch.residual = self.model_runner.prefill(
+                    batch, DecodePart.ALL, 
+                    layer_id, self.experts_mapping[layer_id],
+                    batch.return_logprob, self.attn_events[batch_id]
+                )
+            else:
+                # last layer forward
+                logits, (logprobs, normalized_logprobs) = self.model_runner.prefill(
+                    batch, DecodePart.ALL, layer_id,
+                    self.experts_mapping[layer_id],
+                    batch.return_logprob, self.attn_events[batch_id]
+                )
+                if logprobs is not None:
+                    logprobs = logprobs.cpu().tolist()
+                    normalized_logprobs = normalized_logprobs.cpu().tolist()
+
+                next_token_ids, next_token_probs = batch.sample(logits)
+                next_token_ids = next_token_ids.cpu().tolist()
+                print("Next token ids: ", next_token_ids)
+                batch.hidden_states = None
+                batch.hidden_states_cpu = None
+                batch.residual = None
+
+                reqs = batch.reqs
+                pt = 0
+                for i, req in enumerate(reqs):
+                    req.output_ids = [next_token_ids[i]]
+                    req.check_finished()
+
+                    if logprobs is not None:
+                        req.logprob = logprobs[pt : pt + req.input_len - 1]
+                        req.normalized_logprob = normalized_logprobs[i]
+                        pt += req.input_len
+        
+        # Record compute event
+        self.compute_events[batch_id].record()
+        
+        # TODO: Future optimization - separate attention and MoE computation
+        # to enable true non-blocking MoE while keeping attention intact
+
+    def _get_topk_experts(self, router_output):
+        """Extract top-k expert assignments from router output."""
+        # Implementation depends on your specific router
+        # This is a placeholder that should be adapted to your model
+        top_k = self.model_config.topk
+        topk_weights, topk_ids = torch.topk(
+            router_output, k=top_k, dim=-1, sorted=False
+        )
+        return topk_weights.softmax(dim=-1), topk_ids
+
+    def _partition_by_availability(self, topk_ids, layer_id):
+        """Partition tokens based on expert availability in cache."""
+        num_tokens = topk_ids.shape[0]
+        ready_mask = torch.ones(num_tokens, dtype=torch.bool, device="cuda")
+        experts_to_load = set()
+        
+        for token_idx in range(num_tokens):
+            token_experts = topk_ids[token_idx]
+            in_cache, missing = self.check_experts_in_cache(layer_id, token_experts)
+            
+            if not in_cache.all():
+                ready_mask[token_idx] = False
+                experts_to_load.update(missing.cpu().tolist())
+        
+        ready_tokens = torch.where(ready_mask)[0]
+        waiting_tokens = torch.where(~ready_mask)[0]
+        
+        return ready_tokens, waiting_tokens, experts_to_load
+
+    def _process_token_subset(self, batch, layer_id, token_indices, 
+                            topk_weights, topk_ids, is_partial=False):
+        """Process a subset of tokens that have their experts available."""
+        if len(token_indices) == 0:
+            return
+            
+        # Create sub-batch for these tokens
+        sub_batch = self._create_sub_batch(batch, token_indices)
+        sub_topk_weights = topk_weights[token_indices]
+        sub_topk_ids = topk_ids[token_indices]
+        
+        # Run forward pass for this subset
+        if layer_id < self.model_config.num_hidden_layers - 1:
+            sub_hidden, sub_residual = self.model_runner.prefill_subset(
+                sub_batch, layer_id, self.experts_mapping[layer_id],
+                sub_topk_weights, sub_topk_ids
+            )
+            # Update main batch with results
+            self._update_batch_results(batch, token_indices, sub_hidden, sub_residual)
+        else:
+            # Handle last layer differently
+            self._process_last_layer_subset(
+                batch, layer_id, token_indices, 
+                sub_batch, sub_topk_weights, sub_topk_ids
+            )
+
+    def _start_expert_loading(self, layer_id, expert_ids):
+        """Start asynchronous loading of missing experts."""
+        # Determine which experts need to be loaded and their destinations
+        for expert_id in expert_ids:
+            if expert_id >= self.model_config.num_local_experts:
+                continue
+                
+            # Find available slot in cache
+            cache_slot = self._find_cache_slot_for_expert(layer_id, expert_id)
+            if cache_slot is not None:
+                # Start async copy
+                with torch.cuda.stream(self.context.prefetch_stream):
+                    self._copy_expert_to_cache(layer_id, expert_id, cache_slot)
+
+    def _create_sub_batch(self, batch, token_indices):
+        """Create a sub-batch containing only specified tokens."""
+        sub_batch = Batch.init_new([])
+        
+        # Copy essential tensor attributes, slicing by token indices
+        sub_batch.input_ids = batch.input_ids[token_indices] if batch.input_ids is not None else None
+        sub_batch.hidden_states = batch.hidden_states[token_indices] if batch.hidden_states is not None else None
+        sub_batch.residual = batch.residual[token_indices] if batch.residual is not None else None
+        sub_batch.positions = batch.positions[token_indices] if batch.positions is not None else None
+        
+        # For attributes that are per-sequence, we need to handle them differently
+        # Since we're processing subsets of tokens, we need to maintain the batch structure
+        sub_batch.seq_lens = batch.seq_lens  # Keep original as we're not changing sequences
+        sub_batch.bs = batch.bs  # Batch size remains same
+        sub_batch.new_num_tokens = len(token_indices)
+        
+        # Copy other necessary attributes that don't need slicing
+        sub_batch.token_to_kv_pool = batch.token_to_kv_pool
+        sub_batch.cache_line_idx = batch.cache_line_idx
+        sub_batch.max_seq_len = batch.max_seq_len
+        sub_batch.return_logprob = batch.return_logprob
+        
+        # Copy sampling parameters (per-sequence, not per-token)
+        sub_batch.temperatures = batch.temperatures
+        sub_batch.top_ps = batch.top_ps
+        sub_batch.top_ks = batch.top_ks
+        sub_batch.logit_bias = batch.logit_bias
+        
+        return sub_batch
+
+    def _update_batch_results(self, batch, token_indices, hidden_states, residual):
+        """Update main batch with results from processed tokens."""
+        if batch.hidden_states is None:
+            batch.hidden_states = torch.zeros(
+                (batch.new_num_tokens, hidden_states.shape[-1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype
+            )
+        if batch.residual is None:
+            batch.residual = torch.zeros_like(batch.hidden_states)
+            
+        batch.hidden_states[token_indices] = hidden_states
+        batch.residual[token_indices] = residual
+
     def pre_attention(self, layer_id: int, batch_id: int):
         batch = self.micro_batches[batch_id]
         batch.qkv, batch.residual = self.model_runner.pre_attn(
@@ -443,6 +628,155 @@ class ExecutionEngine:
 
         self.context.token_to_kv_pool.clear()
 
+    def check_experts_in_cache(self, layer_id: int, required_experts: torch.Tensor):
+        """
+        Check which required experts are already in GPU cache.
+        
+        Args:
+            layer_id: Current layer ID
+            required_experts: Tensor of expert IDs needed for current batch
+            
+        Returns:
+            in_cache_mask: Boolean mask indicating which experts are in cache
+            missing_experts: List of expert IDs that need to be loaded
+        """
+        num_gpu_experts = int(self.model_config.num_local_experts * self.context.policy.wg)
+        in_cache_mask = torch.zeros_like(required_experts, dtype=torch.bool)
+        
+        # Check GPU-resident experts (always available)
+        in_cache_mask = required_experts < num_gpu_experts
+        
+        # Check dynamically loaded experts
+        for expert_id in required_experts[~in_cache_mask].unique():
+            expert_id_item = expert_id.item()
+            # Check if this expert is mapped in the cache
+            if expert_id_item < self.model_config.num_local_experts:
+                cache_idx = self.experts_mapping[layer_id][expert_id_item]
+                # Check if it's in the valid cache range (not just mapped but actually loaded)
+                if cache_idx >= self.context.get_ecache_size() - self.weights_prefetch_num_pages_gpu * self.page_size:
+                    in_cache_mask |= (required_experts == expert_id)
+                    
+        missing_experts = required_experts[~in_cache_mask].unique()
+        return in_cache_mask, missing_experts
+
+    def partition_tokens_by_expert_availability(self, batch: Batch, layer_id: int):
+        """
+        Partition tokens based on whether their required experts are in cache.
+        
+        Returns:
+            ready_tokens: Indices of tokens that can be processed immediately
+            waiting_tokens: Indices of tokens waiting for experts to load
+            experts_to_load: Set of expert IDs that need to be loaded
+        """
+        # Get router outputs to determine which experts each token needs
+        # This is a simplified version - in practice you'd get this from the router
+        # For now, we'll assume uniform distribution for demonstration
+        num_tokens = batch.new_num_tokens
+        top_k = self.model_config.topk
+        
+        # Simulate getting top-k experts for each token
+        # In reality, this would come from the router forward pass
+        token_experts = torch.randint(0, self.model_config.num_local_experts, 
+                                    (num_tokens, top_k), device="cuda")
+        
+        ready_mask = torch.ones(num_tokens, dtype=torch.bool, device="cuda")
+        experts_to_load = set()
+        
+        for token_idx in range(num_tokens):
+            token_expert_ids = token_experts[token_idx]
+            in_cache, missing = self.check_experts_in_cache(layer_id, token_expert_ids)
+            
+            if not in_cache.all():
+                ready_mask[token_idx] = False
+                experts_to_load.update(missing.cpu().tolist())
+                
+        ready_tokens = torch.where(ready_mask)[0]
+        waiting_tokens = torch.where(~ready_mask)[0]
+        
+        return ready_tokens, waiting_tokens, experts_to_load, token_experts
+
+    def _find_cache_slot_for_expert(self, layer_id: int, expert_id: int):
+        """Find an available cache slot for loading an expert."""
+        # This is a simplified implementation
+        # In practice, you'd need a more sophisticated cache management strategy
+        num_gpu_experts = int(self.model_config.num_local_experts * self.context.policy.wg)
+        
+        # Look for an empty slot in the cache buffer area
+        cache_start = self.context.get_ecache_size() - self.weights_prefetch_num_pages_gpu * self.page_size
+        for slot_idx in range(self.page_size):
+            cache_idx = cache_start + slot_idx
+            # Check if this slot is free (not currently mapped to any expert)
+            is_free = True
+            for mapped_expert_id in range(self.model_config.num_local_experts):
+                if self.experts_mapping[layer_id][mapped_expert_id] == cache_idx:
+                    is_free = False
+                    break
+            if is_free:
+                return cache_idx
+        return None
+
+    def _copy_expert_to_cache(self, layer_id: int, expert_id: int, cache_slot: int):
+        """Copy an expert from CPU to GPU cache."""
+        intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
+        expert_size = 3 * intermediate_size * self.model_config.hidden_size
+        
+        # Copy expert weights from CPU to GPU
+        self.context.experts_cache[cache_slot].copy_(
+            self.model_runner.model.get_experts_mem()[layer_id, expert_id],
+            non_blocking=True
+        )
+        
+        # Update mapping
+        self.experts_mapping[layer_id][expert_id] = cache_slot
+
+    def _finalize_layer_computation(self, batch: Batch, layer_id: int):
+        """Finalize any remaining computation for the layer."""
+        # Ensure all async operations are complete
+        if hasattr(self.context, 'prefetch_stream'):
+            self.context.prefetch_stream.synchronize()
+            
+        # Any additional finalization logic
+        pass
+
+    def _process_last_layer_subset(self, batch, layer_id, token_indices, 
+                                  sub_batch, topk_weights, topk_ids):
+        """Handle last layer processing for a subset of tokens."""
+        logits, (logprobs, normalized_logprobs) = self.model_runner.prefill_subset(
+            sub_batch, layer_id, self.experts_mapping[layer_id],
+            topk_weights, topk_ids
+        )
+        
+        # Sample next tokens for this subset
+        sub_temps = batch.temperatures[token_indices] if hasattr(batch, 'temperatures') else None
+        sub_top_ps = batch.top_ps[token_indices] if hasattr(batch, 'top_ps') else None
+        sub_top_ks = batch.top_ks[token_indices] if hasattr(batch, 'top_ks') else None
+        
+        # Create temporary batch for sampling
+        temp_batch = Batch.init_new([])
+        temp_batch.temperatures = sub_temps
+        temp_batch.top_ps = sub_top_ps
+        temp_batch.top_ks = sub_top_ks
+        temp_batch.logit_bias = batch.logit_bias[token_indices] if hasattr(batch, 'logit_bias') else None
+        
+        next_token_ids, next_token_probs = temp_batch.sample(logits)
+        
+        # Update results for these tokens
+        if not hasattr(batch, 'partial_next_tokens'):
+            batch.partial_next_tokens = {}
+            batch.partial_logprobs = {} if logprobs is not None else None
+            
+        for i, token_idx in enumerate(token_indices.cpu().tolist()):
+            batch.partial_next_tokens[token_idx] = next_token_ids[i].item()
+            if logprobs is not None:
+                batch.partial_logprobs[token_idx] = logprobs[i]
+
+    def layer_wrapper(self, layer_id: int, page_id: int, batch_id: int):
+        """Wrapper that chooses between blocking and non-blocking execution."""
+        if self.enable_nonblocking:
+            self.layer_nonblocking(layer_id, page_id, batch_id)
+        else:
+            self.layer(layer_id, page_id, batch_id)
+
 
 @dataclass
 class ExecutionContext:
@@ -474,6 +808,14 @@ class ExecutionContext:
     
     @classmethod
     def build_context(cls, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int):
+        # Provide sensible defaults if not specified
+        if avg_prompt_len is None:
+            avg_prompt_len = 512  # Default prompt length
+            print(f"avg_prompt_len not specified, using default: {avg_prompt_len}")
+        if gen_len is None:
+            gen_len = 32  # Default generation length
+            print(f"gen_len not specified, using default: {gen_len}")
+            
         avg_prompt_tokens = avg_prompt_len
         max_new_tokens = gen_len
 

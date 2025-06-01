@@ -75,7 +75,8 @@ class ModelRpcServer(rpyc.Service):
         self.hardware_config = HardwareConfig.init(torch.cuda.get_device_name(0), 
                                                    self.model_runner.total_cpu_memory,
                                                    server_args.cpu_mem_bdw,
-                                                   server_args.tp_size
+                                                   server_args.tp_size,
+                                                   server_args.enable_nonblocking_fwd_pass
                                                    )
 
         # Init running status
@@ -148,7 +149,7 @@ class ModelRpcServer(rpyc.Service):
             for j in range(self.exe_engine.weights_prefetch_num_pages_cpu):
                 for k in range(num_mb):
                     # preattn and attn are done in layer(i, 0, k)
-                    self.exe_engine.layer(i, j, k)
+                    self.exe_engine.layer_wrapper(i, j, k)
                     if j == 0:
                         self.exe_engine.offload_kv_cache(i, k)
                     if num_mb > 1:

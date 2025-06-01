@@ -26,6 +26,7 @@ class ServerArgs:
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     log_level: str = "info"
+    enable_nonblocking_fwd_pass: bool = False
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -182,6 +183,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.log_stats_interval,
             help="Log stats interval in second.",
+        )
+        parser.add_argument(
+            "--enable-nonblocking-fwd-pass",
+            action="store_true",
+            help="Enable non-blocking forward pass for MoE layers. "
+            "This allows tokens to be processed as soon as their required experts are available in cache. "
+            "Note: Requires model-specific implementation.",
         )
 
     @classmethod

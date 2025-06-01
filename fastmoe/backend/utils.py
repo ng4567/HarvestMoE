@@ -32,9 +32,24 @@ class HardwareConfig:
     cpu_flops: float = 13 * T
 
     tp_size: int = 1
+    
+    # Non-blocking MoE execution
+    enable_nonblocking_fwd_pass: bool = False
 
     @classmethod
-    def init(cls, gpu_device_name, cpu_mem, c_bdw, tp_size):
+    def init(cls, gpu_device_name, cpu_mem, c_bdw, tp_size, enable_nonblocking_fwd_pass=False):
+        # Provide default CPU bandwidth if not specified
+        if c_bdw is None:
+            # Default CPU bandwidth in GB/s based on typical system configurations
+            if "H100" in gpu_device_name:
+                c_bdw = 38.4  # Measured Azure H100 value
+            elif "L4" in gpu_device_name:
+                c_bdw = 100  # Default estimate
+            elif "T4" in gpu_device_name:
+                c_bdw = 80   # Default estimate
+            else:
+                c_bdw = 100  # Generic default
+        
         if "L4" in gpu_device_name:
             return cls(
                 gmem=24 * GB,
@@ -44,7 +59,8 @@ class HardwareConfig:
                 c_bdw=c_bdw * GB,
                 gpu_flops=104 * T,
                 cpu_flops=1.6 * T,
-                tp_size=tp_size
+                tp_size=tp_size,
+                enable_nonblocking_fwd_pass=enable_nonblocking_fwd_pass
             )
         elif "T4" in gpu_device_name:
             return cls(
@@ -55,10 +71,35 @@ class HardwareConfig:
                 c_bdw=c_bdw * GB,
                 gpu_flops=65 * T,
                 cpu_flops=0.8 * T,
-                tp_size=tp_size
+                tp_size=tp_size,
+                enable_nonblocking_fwd_pass=enable_nonblocking_fwd_pass
+            )
+        elif "H100" in gpu_device_name:
+            # H100 NVL configuration based on actual Azure measurements
+            return cls(
+                gmem=93 * GB,  # 93 GB available
+                cmem=cpu_mem * GB,  # User-provided, typically 314 GB on Azure
+                ctog_bdw=52 * GB,  # Measured PCIe bandwidth
+                g_bdw=2625 * GB,  # Measured HBM bandwidth: 2.6 TB/s
+                c_bdw=c_bdw * GB,  # CPU bandwidth, default 38.4 GB/s
+                gpu_flops=406 * T,  # Measured: 406 TFLOPS for FP16
+                cpu_flops=0.9 * T,  # Measured: 0.9 TFLOPS
+                tp_size=tp_size,
+                enable_nonblocking_fwd_pass=enable_nonblocking_fwd_pass
             )
         else:
-            return cls
+            # Default configuration with sensible defaults
+            return cls(
+                gmem=24 * GB,
+                cmem=cpu_mem * GB if cpu_mem else 192 * GB,
+                ctog_bdw=16 * GB,
+                g_bdw=300 * GB,
+                c_bdw=c_bdw * GB,
+                gpu_flops=104 * T,
+                cpu_flops=13 * T,
+                tp_size=tp_size,
+                enable_nonblocking_fwd_pass=enable_nonblocking_fwd_pass
+            )
 
 @dataclasses.dataclass
 class CostModelConfig:

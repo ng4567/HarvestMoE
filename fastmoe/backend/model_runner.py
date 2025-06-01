@@ -261,3 +261,71 @@ class ModelRunner:
         kwargs["experts_mapping"] = experts_mapping
         return self.forward_post_attn(**kwargs)
         
+    @torch.inference_mode()
+    def get_router_logits(self, batch: Batch, layer_id: int) -> torch.Tensor:
+        """Get router logits for expert selection without running the full forward pass."""
+        # Get the router for this layer
+        # This assumes the model has a method to access routers by layer
+        router = self.model.get_router(layer_id)
+        
+        # Run just the router forward pass
+        hidden_states = batch.hidden_states
+        if hidden_states is None:
+            # If no hidden states yet, run embedding layer
+            # Handle different model architectures
+            if hasattr(self.model, 'embed_tokens'):
+                hidden_states = self.model.embed_tokens(batch.input_ids)
+            elif hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+                # For models like PhiMoE where embed_tokens is nested
+                hidden_states = self.model.model.embed_tokens(batch.input_ids)
+            else:
+                raise AttributeError("Cannot find embed_tokens in model structure")
+            
+        # For models with StackedLinear routers, we need to pass the layer index
+        # The router should be able to handle this
+        if hasattr(router, '__call__'):
+            # If it's a StackedLinear, it expects (layer_index, input)
+            router_logits, _ = router(layer_id, hidden_states)
+        else:
+            # Fallback for other router types
+            router_logits = router(hidden_states)
+            
+        return router_logits
+    
+    @torch.inference_mode()
+    def prefill_subset(self, sub_batch: Batch, layer_id: int, 
+                      experts_mapping: torch.Tensor,
+                      topk_weights: torch.Tensor, 
+                      topk_ids: torch.Tensor) -> tuple:
+        """Process a subset of tokens with their expert assignments."""
+        # Create InputMetadata object
+        input_metadata = InputMetadata.create(
+            forward_mode=ForwardMode.PREFILL,
+            decode_part=DecodePart.ALL,
+            seq_lens=sub_batch.seq_lens if hasattr(sub_batch, 'seq_lens') else None,
+            positions=sub_batch.positions if hasattr(sub_batch, 'positions') else None,
+            start_loc=sub_batch.start_loc_gpu if hasattr(sub_batch, 'start_loc_gpu') else None,
+            max_seq_len=sub_batch.max_seq_len if hasattr(sub_batch, 'max_seq_len') else None,
+            out_cache_loc=sub_batch.out_cache_loc if hasattr(sub_batch, 'out_cache_loc') else None,
+            token_to_kv_pool=sub_batch.token_to_kv_pool if hasattr(sub_batch, 'token_to_kv_pool') else None,
+            return_logprob=False,
+            attn_event=None,
+            experts_mapping=experts_mapping,
+        )
+        
+        # Store the pre-computed expert assignments in input_metadata
+        input_metadata.topk_weights = topk_weights
+        input_metadata.topk_ids = topk_ids
+        
+        # Call the model's forward_with_expert_assignments method
+        return self.model.forward_with_expert_assignments(
+            input_ids=sub_batch.input_ids,
+            positions=input_metadata.positions,
+            input_metadata=input_metadata,
+            hidden_states=sub_batch.hidden_states,
+            residual=sub_batch.residual,
+            cur_layers=[layer_id],
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+        
