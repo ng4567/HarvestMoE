@@ -10,7 +10,38 @@ high resource utilization, and a performance model, *HRM*, based on a Hierarchic
 find policies with higher throughput than existing systems.
 
 
-## Installation 
+## Nikhil Pre-Install notes:
+
+Had to run the following manually before `pip install -e .` would work:
+
+```bash
+conda install numpy
+sudo apt-get install g++
+```
+
+
+Add nvidia repo and install nvidia h100 drivers:
+
+```bash
+sudo apt-get install -y software-properties-common
+sudo apt-get install -y nvidia-driver-535
+```
+
+log into hugging face cli: `huggingface-cli login` (make sure to use a read token)
+
+
+after pip install -e:
+
+```bash
+sudo apt-get install -y nvidia-cuda-toolkit
+conda uninstall torch
+conda install torch-gpu
+pip uninstall torch
+pip install "vllm>=0.2.7,<0.4.1"
+conda install transformers
+```
+
+## Installation
 ```
 git clone -b asplos-artifact https://github.com/caoshiyi/FastMoE.git 
 cd FastMoE
@@ -21,6 +52,7 @@ conda install -c https://software.repos.intel.com/python/conda/ -c conda-forge m
 pip install -e .
 pip install triton==2.2.0
 ```
+
 
 ## Run tests (MTBench)
 The first-time weights loading can take ~10min. Adjust `--gen-len` for different generation configurations.
