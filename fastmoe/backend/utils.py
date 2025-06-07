@@ -35,7 +35,18 @@ class HardwareConfig:
 
     @classmethod
     def init(cls, gpu_device_name, cpu_mem, c_bdw, tp_size):
-        if "L4" in gpu_device_name:
+        if "H100" in gpu_device_name:
+            return cls(
+                gmem=93 * GB,  # H100 NVL has ~93GB available memory (measured)
+                cmem=cpu_mem * GB,
+                ctog_bdw=24 * GB,  # H100 has high PCIe 5.0/NVLink bandwidth
+                g_bdw=3350 * GB,  # Measured ~3320-3397 GB/s, using 3350 GB/s
+                c_bdw=c_bdw * GB,
+                gpu_flops=450 * T,  # Measured ~400-472 TFLOPS sustained performance
+                cpu_flops=1.6 * T,  # Conservative CPU estimate
+                tp_size=tp_size
+            )
+        elif "L4" in gpu_device_name:
             return cls(
                 gmem=24 * GB,
                 cmem=cpu_mem * GB,
