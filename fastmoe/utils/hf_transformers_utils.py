@@ -14,7 +14,6 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-
 def download_from_hf(model_path: str):
     if os.path.exists(model_path):
         return model_path
@@ -82,14 +81,21 @@ TOPK_KEYS = [
     "moe_top_k",
 ]
 
-
 def get_context_length(config):
     """Get the context length of a model from a huggingface model config."""
     rope_scaling = getattr(config, "rope_scaling", None)
-    if rope_scaling:
-        rope_scaling_factor = config.rope_scaling["factor"]
+    if rope_scaling and isinstance(rope_scaling, dict):
+        # Handle Phi-3.5-MoE's LongRoPE scaling
+        if rope_scaling.get("type") == "longrope":
+            # Use long_mscale for the scaling factor
+            rope_scaling_factor = rope_scaling.get("long_mscale", 1.0)
+        # Handle traditional RoPE scaling
+        elif "factor" in rope_scaling:
+            rope_scaling_factor = rope_scaling["factor"]
+        else:
+            rope_scaling_factor = 1.0
     else:
-        rope_scaling_factor = 1
+        rope_scaling_factor = 1.0
 
     for key in CONTEXT_LENGTH_KEYS:
         val = getattr(config, key, None)

@@ -263,6 +263,42 @@ class ExecutionEngine:
 
     # read: weights, write: kvcache, 
     def layer(self, layer_id: int, page_id: int, batch_id: int):
+        # Add debug prints for expert load monitoring
+        if hasattr(self, 'expert_load_stats') is False:
+            self.expert_load_stats = {}
+            # Initialize expert load statistics for all layers at once
+            for i in range(self.model_config.num_hidden_layers):
+                self.expert_load_stats[i] = torch.zeros(self.model_config.num_local_experts, device='cuda')
+        
+        # Get the expert routing information from the model
+        with torch.cuda.stream(self.context.cur_stream):
+            # Wait for prefetch
+            self.prefetch_events[batch_id].wait(self.context.cur_stream)
+            
+            # Get expert routing information
+            expert_indices = self.model_runner.model.get_expert_indices()  # This should return the expert indices for current batch
+            if expert_indices is not None:
+                # Update load statistics
+                unique_experts, counts = torch.unique(expert_indices, return_counts=True)
+                self.expert_load_stats[layer_id][unique_experts] += counts
+                
+                # Print warning if any expert is overloaded (e.g., more than 50% of batch size)
+                batch_size = self.micro_batches[batch_id].bs
+                overloaded_experts = unique_experts[counts > batch_size * 0.5]
+                if len(overloaded_experts) > 0:
+                    print(f"[WARNING] Layer {layer_id} has overloaded experts: {overloaded_experts.tolist()}")
+                    print(f"Load distribution: {counts[counts > batch_size * 0.5].tolist()}")
+                    print(f"Batch size: {batch_size}")
+                
+                # Print overall statistics every 100 batches
+                if batch_id % 100 == 0:
+                    print(f"\n[DEBUG] Layer {layer_id} Expert Load Statistics:")
+                    print(f"Total tokens processed: {self.expert_load_stats[layer_id].sum().item()}")
+                    print(f"Max load per expert: {self.expert_load_stats[layer_id].max().item()}")
+                    print(f"Min load per expert: {self.expert_load_stats[layer_id].min().item()}")
+                    print(f"Mean load per expert: {self.expert_load_stats[layer_id].mean().item()}")
+                    print(f"Std dev of load: {self.expert_load_stats[layer_id].std().item()}\n")
+        
         print("Prefill layer: ", layer_id, "batch: ", batch_id)
         # wait on prefetch weights, load hidden and offload kv cache of the same cacheline
         batch = self.micro_batches[batch_id]
@@ -407,20 +443,36 @@ class ExecutionEngine:
         # link the experts cache to the model
         self.model_runner.model.link_gpu_experts_cache(self.context.experts_cache)
         num_gpu_experts = int(self.model_config.num_local_experts * self.context.policy.wg)
+        
+        # DEBUG: Print GPU experts initialization details
+        print(f"[DEBUG] GPU Experts Initialization:")
+        print(f"  - Experts permanently on GPU: {num_gpu_experts}")
+        print(f"  - Expert cache size: {self.context.get_ecache_size()} slots")
+        
         if num_gpu_experts > 0:
             for i in range(self.model_config.num_hidden_layers):
                 self.experts_mapping[i][:num_gpu_experts] = torch.arange(i * num_gpu_experts, (i + 1) * num_gpu_experts, dtype=torch.int64, device="cuda")
+            print(f"  - GPU expert mapping initialized for {self.model_config.num_hidden_layers} layers")
         
         assert self.model_config.num_hidden_layers % 2 == 0
         
         num_comp_experts = self.context.policy.eg
         page_size = num_comp_experts - num_gpu_experts
+        
+        # DEBUG: Print paging details
+        print(f"[DEBUG] Expert Paging Configuration:")
+        print(f"  - Page size (experts per page): {page_size}")
+        print(f"  - CPU prefetch pages: {self.weights_prefetch_num_pages_cpu}")
+        print(f"  - GPU prefetch pages: {self.weights_prefetch_num_pages_gpu}")
+        
         for i in range(self.model_config.num_hidden_layers):
             for page_id in range(self.weights_prefetch_num_pages_cpu):
                 start_pos = num_gpu_experts + page_id * page_size
                 gpu_page_id = (i * self.weights_prefetch_num_pages_cpu + page_id) % self.weights_prefetch_num_pages_gpu
                 start_pos_cache = self.context.get_ecache_size() - self.weights_prefetch_num_pages_gpu * page_size + gpu_page_id * page_size
                 self.experts_mapping[i][start_pos : start_pos + page_size] = torch.arange(start_pos_cache, start_pos_cache + page_size, dtype=torch.int64, device="cuda")
+        
+        print(f"[DEBUG] Expert mapping setup complete for all {self.model_config.num_hidden_layers} layers")
 
     def delete_gpu_context(self):
         self.context.delete_gpu_context()
@@ -513,11 +565,28 @@ class ExecutionContext:
         num_experts_gpu=int(model_config.num_local_experts * policy.wg)
         if num_comp_experts != model_config.num_local_experts:
             assert num_experts_gpu == 0
+        
+        # DEBUG: Print expert cache configuration
+        print(f"[DEBUG] Expert Cache Configuration:")
+        print(f"  - Computing experts (eg): {num_comp_experts}")
+        print(f"  - Experts on GPU: {num_experts_gpu}")
+        print(f"  - Experts on CPU: {model_config.num_local_experts - num_experts_gpu}")
+        print(f"  - Policy weight GPU ratio (wg): {policy.wg:.3f}")
+        print(f"  - Experts that need to be dynamically loaded: {num_comp_experts - num_experts_gpu}")
+        
         # if we have enough GPU memory, the buffer is 2 * (num_experts - num_experts_gpu)
         # elif we do not have enough GPU memory, the buffer is of size 2 * num_comp_experts
         experts_pool_size  = num_layers * num_experts_gpu + 2 * (num_comp_experts - num_experts_gpu)
         intermediate_size = model_config.intermediate_size // hardware_config.tp_size
         experts_cache = torch.empty(experts_pool_size, 3 * intermediate_size * model_config.hidden_size, dtype=torch.get_default_dtype(), device="cuda")
+        
+        # DEBUG: Print memory allocation details
+        expert_memory_per_expert_gb = (3 * intermediate_size * model_config.hidden_size * 2) / (1024**3)  # assuming fp16
+        total_experts_cache_gb = (experts_pool_size * 3 * intermediate_size * model_config.hidden_size * 2) / (1024**3)
+        print(f"[DEBUG] Expert Memory Allocation:")
+        print(f"  - Memory per expert: {expert_memory_per_expert_gb:.3f} GB")
+        print(f"  - Total experts cache pool size: {experts_pool_size} expert slots")
+        print(f"  - Total GPU expert cache memory: {total_experts_cache_gb:.3f} GB")
 
         experts_pin = torch.empty(((num_comp_experts - num_experts_gpu), 
                                     3 * intermediate_size * model_config.hidden_size), 
