@@ -1,3 +1,7 @@
+Results on Phi 3.5 no mods:
+Time: 54.943s
+Throughput: 375.663 tokens/s
+
 # MoE-Lightning: Artifact Evaluation
 
 This document contains instruction for ASPLOS 2025 artifact evaluation for the paper *MoE-Lightning: High-Throughput MoE Inference on

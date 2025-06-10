@@ -88,7 +88,7 @@ class ModelRpcServer(rpyc.Service):
         self.exe_engine: ExecutionEngine = None
 
         with _set_default_torch_dtype(torch.float16):
-            self.build_tasks_and_exec_ctx(server_args.avg_prompt_len, server_args.gen_len)
+            self.build_tasks_and_exec_ctx(server_args.avg_prompt_len, server_args.gen_len, server_args.log_load_balancing)
 
     def flush_cache(self):
         if len(self.forward_queue) == 0 and (
@@ -128,8 +128,8 @@ class ModelRpcServer(rpyc.Service):
         self.out_pyobjs = []
         return ret
     
-    def build_tasks_and_exec_ctx(self, avg_prompt_len, gen_len):
-        self.exe_engine = ExecutionEngine(self.model_runner, self.model_config, self.hardware_config, avg_prompt_len, gen_len)
+    def build_tasks_and_exec_ctx(self, avg_prompt_len, gen_len, log_load_balancing=False):
+        self.exe_engine = ExecutionEngine(self.model_runner, self.model_config, self.hardware_config, avg_prompt_len, gen_len, enable_load_balancing_log=log_load_balancing)
         self.exe_engine.init_gpu_experts()
         torch.cuda.synchronize()
 

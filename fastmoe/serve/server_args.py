@@ -26,6 +26,7 @@ class ServerArgs:
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     log_level: str = "info"
+    log_load_balancing: bool = False
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -182,6 +183,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.log_stats_interval,
             help="Log stats interval in second.",
+        )
+        parser.add_argument(
+            "--log-load-balancing",
+            type=bool,
+            default=ServerArgs.log_load_balancing,
+            help="Log load balancing stats.",
         )
 
     @classmethod

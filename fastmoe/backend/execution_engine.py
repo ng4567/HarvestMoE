@@ -2,6 +2,9 @@ import torch
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List
+import csv
+import sys
+import os
 
 from fastmoe.utils.model_config import ModelConfig
 from fastmoe.backend.memory import TokenToKVPool
@@ -13,7 +16,7 @@ from fastmoe.backend.model_runner import ModelRunner
 
 
 class ExecutionEngine:
-    def __init__(self, model_runner: ModelRunner, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int):
+    def __init__(self, model_runner: ModelRunner, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int, enable_load_balancing_log: bool = False):
         self.model_runner = model_runner
         self.model_config = model_config
         self.hardware_config = hardware_config
@@ -47,6 +50,17 @@ class ExecutionEngine:
 
         # experts cache mapping: experts_id -> idx in self.context.experts_cache
         self.experts_mapping = [torch.empty(self.model_config.num_local_experts, dtype=torch.int64, device="cuda") for _ in range(self.model_config.num_hidden_layers)]
+        
+        # CSV logging for load balancing research (controlled by command line argument)
+        # Fallback: check sys.argv if not explicitly passed
+        if enable_load_balancing_log:
+            self.enable_load_balancing_log = True
+        else:
+            self.enable_load_balancing_log = '--log-load-balancing' in sys.argv
+        self.csv_file = None
+        self.csv_writer = None
+        if self.enable_load_balancing_log:
+            self._init_load_balancing_csv()
     
     def init_weights_prefetch_meta(self):
 
@@ -278,6 +292,9 @@ class ExecutionEngine:
             # Get expert routing information
             expert_indices = self.model_runner.model.get_expert_indices()  # This should return the expert indices for current batch
             if expert_indices is not None:
+                # Log expert usage for load balancing research
+                self._log_expert_usage(layer_id, batch_id, expert_indices)
+                
                 # Update load statistics
                 unique_experts, counts = torch.unique(expert_indices, return_counts=True)
                 self.expert_load_stats[layer_id][unique_experts] += counts
@@ -451,7 +468,12 @@ class ExecutionEngine:
         
         if num_gpu_experts > 0:
             for i in range(self.model_config.num_hidden_layers):
-                self.experts_mapping[i][:num_gpu_experts] = torch.arange(i * num_gpu_experts, (i + 1) * num_gpu_experts, dtype=torch.int64, device="cuda")
+                self.experts_mapping[i][:num_gpu_experts] = torch.arange(
+                    i * num_gpu_experts, 
+                    (i + 1) * num_gpu_experts, 
+                    dtype=torch.int64, 
+                    device="cuda"
+                    )
             print(f"  - GPU expert mapping initialized for {self.model_config.num_hidden_layers} layers")
         
         assert self.model_config.num_hidden_layers % 2 == 0
@@ -476,6 +498,8 @@ class ExecutionEngine:
 
     def delete_gpu_context(self):
         self.context.delete_gpu_context()
+        # Close CSV logging if enabled
+        self._close_load_balancing_csv()
     
     def reset(self):
         self.micro_batches = None
@@ -494,6 +518,93 @@ class ExecutionEngine:
         self.num_weights_slots_decode = 0
 
         self.context.token_to_kv_pool.clear()
+
+    def _init_load_balancing_csv(self):
+        """Initialize CSV logging for load balancing research"""
+        self.csv_file_handle = open("load-balancing.csv", 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file_handle)
+        
+        # We'll write header dynamically with the first data row since token count varies
+        self.csv_header_written = False
+
+    def _log_expert_usage(self, layer_id: int, batch_id: int, expert_indices: torch.Tensor):
+        """Log expert usage and cache behavior for load balancing analysis"""
+        if not self.enable_load_balancing_log or expert_indices is None:
+            return
+        try:
+            # Get batch information
+            current_micro_batch = self.micro_batches[batch_id]
+            mini_batch_size = current_micro_batch.bs
+            total_batch_size = sum(micro_batch.bs for micro_batch in self.micro_batches)
+
+            # Determine which experts are in cache vs need to be fetched
+            num_gpu_experts = int(self.model_config.num_local_experts * self.context.policy.wg)
+
+            # Get unique experts used in this batch
+            unique_experts = torch.unique(expert_indices).cpu().tolist()
+
+            # Categorize experts
+            experts_in_cache = [exp for exp in unique_experts if exp < num_gpu_experts]
+            experts_to_fetch = [exp for exp in unique_experts if exp >= num_gpu_experts]
+
+            # Determine top‑k (experts chosen per token).  Fallback to 2
+            try:
+                top_k = int(getattr(self.model_config, 'num_experts_per_tok', 2))
+            except Exception:
+                top_k = 2
+            if top_k <= 0:
+                top_k = 2  # guard against pathological configs that set 0
+            if layer_id == 0 and batch_id == 0:
+                print(f"[DEBUG] Using top_k = {top_k} for expert logging")
+
+            num_tokens = mini_batch_size
+            assert len(expert_indices) >= num_tokens * top_k, (
+                f"Expected at least {num_tokens * top_k} expert indices for "
+                f"this micro‑batch, got {len(expert_indices)}"
+            )
+
+            # Write header dynamically based on actual token count (only once)
+            if not self.csv_header_written:
+                header = [
+                    'moe_layer_id',
+                    'micro_batch_id',
+                    'micro_batch_size',
+                    'experts_in_cache',
+                    'experts_to_fetch',
+                ]
+                # Add two activation columns per token: token_n_activation_0, token_n_activation_1
+                for i in range(num_tokens):
+                    for k in range(top_k):
+                        header.append(f'token_{i}_activation_{k}')
+                self.csv_writer.writerow(header)
+                self.csv_file_handle.flush()
+                self.csv_header_written = True
+                print(f"[INFO] CSV header written (moe_layer_id, micro_batch_id, micro_batch_size, experts_in_cache, experts_to_fetch, per-token activations)")
+
+            # Create row data and flatten per-token activations
+            row_data = [
+                layer_id,          # moe_layer_id
+                batch_id,          # micro_batch_id
+                mini_batch_size,   # micro_batch_size
+                str(experts_in_cache),
+                str(experts_to_fetch),
+            ]
+            # Flatten expert indices into per‑token activations
+            for token_idx in range(num_tokens):
+                start_idx = token_idx * top_k
+                token_experts = expert_indices[start_idx:start_idx + top_k].cpu().tolist()
+                # Ensure we always write exactly top_k activations per token
+                for k in range(top_k):
+                    row_data.append(str(token_experts[k]) if k < len(token_experts) else "")
+            self.csv_writer.writerow(row_data)
+            self.csv_file_handle.flush()  # Ensure data is written immediately
+        except Exception as e:
+            print(f"[WARNING] Failed to log expert usage: {e}")
+
+    def _close_load_balancing_csv(self):
+        """Close the CSV file handle"""
+        if hasattr(self, 'csv_file_handle') and self.csv_file_handle:
+            self.csv_file_handle.close()
 
 
 @dataclass
