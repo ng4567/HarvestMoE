@@ -1,3 +1,18 @@
+# Steps to recreate python env on GCP:
+```bash
+uv init -p=3.11
+uv venv .venv
+source .venv/bin/activate
+uv pip install -r pip-freeze.txt --no-deps
+```
+
+To run on GCP:
+
+Launch server:
+`python -m fastmoe.serve.launch_server --model-path microsoft/Phi-3.5-MoE-instruct --port 30000 --cpu-mem-bdw 76 --avg-prompt-len 77 --gen-len 32`
+
+
+
 Results on Phi 3.5 no mods:
 Time: 54.943s
 Throughput: 375.663 tokens/s
