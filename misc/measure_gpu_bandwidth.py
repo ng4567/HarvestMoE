@@ -4,6 +4,8 @@ import time
 
 model_id = "microsoft/Phi-3.5-MoE-instruct"
 dtype_bytes = 2
+num_trials = 1000
+
 
 print("-----Testing if GPU count >=2 ------\n")
 assert torch.cuda.device_count() >= 2, "GPU count must be >=2"
@@ -79,8 +81,6 @@ expert_tensor = torch.randn(
 expert_size_mb = expert_tensor.nelement() * expert_tensor.element_size() / (1024 * 1024)
 print(f"Created tensor of size {expert_size_mb:.2f} MB on CPU")
 
-num_trials = 10
-
 # Current tensor location: starts on CPU
 current_tensor = expert_tensor
 
@@ -133,6 +133,8 @@ print(f"Average transfer speed: {gpu_gpu_transfer_speed_gbps:.2f} Gb/s (round-tr
 print(f"Estimated one-way speed: {one_way_speed_gbps:.2f} Gb/s\n")
 
 print("------Final results------\n")
+
+print(f"Num trials: {num_trials}")
 if cpu_gpu_transfer_speed_gbps > gpu_gpu_transfer_speed_gbps:
     print(f"CPU > GPU speed: {cpu_gpu_transfer_speed_gbps:.2f} Gb/s transfer is faster than GPU {gpu_gpu_transfer_speed_gbps:.2f} GB/s")
 else:
