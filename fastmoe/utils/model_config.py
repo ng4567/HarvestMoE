@@ -5,7 +5,8 @@ import torch
 from fastmoe.utils.hf_transformers_utils import (get_config, get_context_length, 
                                                 get_num_layers, get_hidden_size, 
                                                 get_num_attention_heads, get_num_kv_heads, 
-                                                get_intermediate_size, get_num_experts, get_topk)
+                                                get_intermediate_size, get_num_experts, get_topk,
+                                                get_num_moe_layers)
 
 
 class ModelConfig:
@@ -33,3 +34,4 @@ class ModelConfig:
         self.num_local_experts = get_num_experts(self.hf_config)
         self.intermediate_size = get_intermediate_size(self.hf_config)
         self.topk = get_topk(self.hf_config)
+        self.num_moe_layers = get_num_moe_layers(self.hf_config)

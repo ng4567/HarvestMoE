@@ -13,6 +13,16 @@ from transformers import (
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
+from transformers.configuration_utils import PretrainedConfig
+
+def get_num_moe_layers(config: PretrainedConfig) -> int:
+    """
+    Get the number of MoE layers in a model from a huggingface model config.
+    """
+    if config.model_type == "phimoe" or config.model_type == "mixtral":
+        return config.num_hidden_layers
+    else:
+        raise ValueError(f"Cannot infer number of MoE layers for model '{config.path}'")
 
 def download_from_hf(model_path: str):
     if os.path.exists(model_path):

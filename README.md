@@ -11,7 +11,10 @@ To run on GCP:
 Launch server:
 `python -m fastmoe.serve.launch_server --model-path microsoft/Phi-3.5-MoE-instruct --port 30000 --cpu-mem-bdw 76 --avg-prompt-len 77 --gen-len 32`
 
-
+Run tests:
+conda deactivate && conda activate fastmoe
+cd benchmarks/mtbench
+python bench.py --port 30000 --max-new-tokens 32 --ubs 324 --n-ub 14
 
 Results on Phi 3.5 no mods:
 Time: 54.943s

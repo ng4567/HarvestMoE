@@ -5,10 +5,93 @@ import sys
 import time
 import traceback
 from typing import List, Optional
-
+import json
+import heapq
 import numpy as np
 import torch
 import torch.distributed as dist
+
+def build_hot_experts_dict(path: str, num_layers: int, top_n: int) -> dict[int, list[int]]:
+    """
+    Return a `{layer_id: [expert indices …]}` mapping containing the
+    `top_n` most‑frequently‑activated experts for *every* MoE layer in
+    one shot.
+
+    Parameters
+    ----------
+    path : str
+        JSON file produced by your logging script.  Must have
+        keys like "layer_0", "layer_1", …
+    num_layers : int
+        Total number of MoE layers in the model.
+    top_n : int
+        How many experts per layer you want to pin on the GPU.
+
+    Returns
+    -------
+    dict[int, list[int]]
+        Example: ``{0: [3, 5, 8, 1], 1: [10, 13, 7, 0], …}``
+    """
+    hot = {}
+    for layer in range(num_layers):
+        hot[layer] = get_expert_activation_frequency(path, layer, top_n)
+    return hot
+
+def get_expert_activation_frequency(path: str, layer_num: int, top_n: int = 2) -> list[int]:
+    """
+    Parse the inputted json file containing activation frequencies for each expert.
+    Return the top_n experts with the highest activation frequencies for the given layer.
+
+    Args:
+        path: Path to the json file containing activation frequencies.
+        layer_num: Layer number to parse.
+        top_n: Number of top experts to return.
+
+    Returns:
+        List of top_n expert indices with highest activation frequencies.
+    """
+    with open(path, "r") as f:
+        data = json.load(f)
+    
+    top_experts = heapq.nlargest(top_n, data[f"layer_{layer_num}"].items(), key=lambda x: x[1])
+    return  [key for key, _ in top_experts]
+
+
+# ------------------------------------------------------------------------
+# Helper: build_hot_experts_dict
+# ------------------------------------------------------------------------
+def build_hot_experts_dict(path: str, num_layers: int, top_n: int) -> dict[int, list[int]]:
+    """
+    Return a `{layer_id: [expert indices …]}` mapping containing the
+    `top_n` most‑frequently‑activated experts for *every* MoE layer in
+    one shot.
+
+    Parameters
+    ----------
+    path : str
+        JSON file produced by your logging script.  Must have
+        keys like "layer_0", "layer_1", …
+    num_layers : int
+        Total number of MoE layers in the model.
+    top_n : int
+        How many experts per layer you want to pin on the GPU.
+
+    Returns
+    -------
+    dict[int, list[int]]
+        Example: ``{0: [3, 5, 8, 1], 1: [10, 13, 7, 0], …}``
+    """
+    hot = {}
+    for layer in range(num_layers):
+        hot[layer] = get_expert_activation_frequency(path, layer, top_n)
+    return hot
+def get_num_experts_that_fit(gpu_id: int, expert_size_bytes: int) -> int:
+    """
+    Get the number of experts that can fit in the given GPU's free memory.
+    """
+    available_memory = get_available_gpu_memory(gpu_id)
+    return available_memory // expert_size_bytes
+
 
 def get_available_gpu_memory(gpu_id, distributed=True):
     """
@@ -196,3 +279,9 @@ def wrap_kernel_launcher(kernel):
             ret_func(grid, num_warps, *args)
 
     return ret_func
+
+if __name__ == "__main__":
+    path = "/home/azureuser/moe-lightning-fork/fastmoe/models/phi-moeexpert-activations.json"
+    data = get_expert_activation_frequency(path, 1, 4)
+    print(data)
+    

@@ -5,7 +5,7 @@ from typing import List
 import csv
 import sys
 import os
-
+import enum
 from fastmoe.utils.model_config import ModelConfig
 from fastmoe.backend.memory import TokenToKVPool
 from fastmoe.backend.optimizer import solve, Policy
@@ -13,16 +13,25 @@ from fastmoe.backend.task import Batch, Req
 from fastmoe.backend.task_meta import ForwardMode, DecodePart
 from fastmoe.backend.utils import HardwareConfig
 from fastmoe.backend.model_runner import ModelRunner
-
+from fastmoe.utils.utils import get_expert_activation_frequency
+from fastmoe.utils.utils import build_hot_experts_dict
+import numpy as np
 
 class ExecutionEngine:
-    def __init__(self, model_runner: ModelRunner, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int, enable_load_balancing_log: bool = False):
+    def __init__(self,
+                 model_runner: ModelRunner,
+                 model_config: ModelConfig,
+                 hardware_config: HardwareConfig,
+                 avg_prompt_len: int,
+                 gen_len: int,
+                 enable_load_balancing_log: bool = False,
+                 activation_json_path: str | None = None):
         self.model_runner = model_runner
         self.model_config = model_config
         self.hardware_config = hardware_config
         self.context = ExecutionContext.build_context(model_config, hardware_config, avg_prompt_len, gen_len)
         self.micro_batches: List[Batch] = None
-
+        
         # sync primititves
         # record in prefetch experts from pin, wait in prefetch experts to pin & post attn
         self.prefetch_events: List[torch.cuda.Event] = None
@@ -61,6 +70,18 @@ class ExecutionEngine:
         self.csv_writer = None
         if self.enable_load_balancing_log:
             self._init_load_balancing_csv()
+
+        # Optional path to the JSON that records expert‑activation
+        # frequencies.  When provided we will pull the "hot" experts
+        # directly from this file rather than the load‑balancing CSV.
+        self.activation_json_path = activation_json_path
+
+        """
+        expert location table: matrix where rows are layers and columns are experts
+        each element of the matrix indicates where in memory the expert weights are stored: "cpu" or gpu_id
+        """
+        self.expert_location_table = np.full((self.model_config.num_moe_layers, self.model_config.num_local_experts), "cpu", dtype=object)
+        print("Num MoE layers: ", self.model_config.num_moe_layers)
     
     def init_weights_prefetch_meta(self):
 
@@ -456,45 +477,76 @@ class ExecutionEngine:
                     return None, None
 
     def init_gpu_experts(self):
-        self.context.init_gpu_experts(self.model_runner.model.get_experts_mem())
-        # link the experts cache to the model
-        self.model_runner.model.link_gpu_experts_cache(self.context.experts_cache)
+        """
+        Populate the permanent GPU cache with the top‑K most frequently
+        used experts for each MoE layer.  If `self.activation_json_path`
+        is None we fall back to the original “first‑N” strategy.
+        """
         num_gpu_experts = int(self.model_config.num_local_experts * self.context.policy.wg)
-        
-        # DEBUG: Print GPU experts initialization details
-        print(f"[DEBUG] GPU Experts Initialization:")
-        print(f"  - Experts permanently on GPU: {num_gpu_experts}")
-        print(f"  - Expert cache size: {self.context.get_ecache_size()} slots")
-        
-        if num_gpu_experts > 0:
-            for i in range(self.model_config.num_hidden_layers):
-                self.experts_mapping[i][:num_gpu_experts] = torch.arange(
-                    i * num_gpu_experts, 
-                    (i + 1) * num_gpu_experts, 
-                    dtype=torch.int64, 
-                    device="cuda"
-                    )
-            print(f"  - GPU expert mapping initialized for {self.model_config.num_hidden_layers} layers")
-        
-        assert self.model_config.num_hidden_layers % 2 == 0
-        
-        num_comp_experts = self.context.policy.eg
-        page_size = num_comp_experts - num_gpu_experts
-        
-        # DEBUG: Print paging details
-        print(f"[DEBUG] Expert Paging Configuration:")
-        print(f"  - Page size (experts per page): {page_size}")
-        print(f"  - CPU prefetch pages: {self.weights_prefetch_num_pages_cpu}")
-        print(f"  - GPU prefetch pages: {self.weights_prefetch_num_pages_gpu}")
-        
-        for i in range(self.model_config.num_hidden_layers):
+        hot_experts: dict[int, list[int]] | None = None
+
+        if self.activation_json_path is not None and num_gpu_experts > 0:
+            hot_experts = build_hot_experts_dict(
+                self.activation_json_path,
+                self.model_config.num_hidden_layers,
+                num_gpu_experts,
+            )
+
+        # ------------------------------------------------------------------
+        # 1. Copy expert weights to the GPU cache
+        # ------------------------------------------------------------------
+        cpu_experts = self.model_runner.model.get_experts_mem()
+        intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
+
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            # Which expert IDs belong in the permanent slice for *this* layer
+            if hot_experts is not None:
+                selected = hot_experts[layer_idx]
+            else:
+                selected = list(range(num_gpu_experts))  # original behaviour
+
+            for slot, expert_id in enumerate(selected):
+                cache_row = layer_idx * num_gpu_experts + slot
+                self.context.experts_cache[cache_row].copy_(cpu_experts[layer_idx, expert_id])
+                # Record mapping: model expects index inside experts_cache
+                self.experts_mapping[layer_idx][slot] = cache_row
+                # Update lookup table so routing code knows where it lives
+                self.expert_location_table[layer_idx, expert_id] = f"gpu:{torch.cuda.current_device()}"
+
+        # Link the populated GPU experts cache to the Phi‑MoE model so that
+        # downstream kernels can access `self.ws.gpu_cache`.
+        self.model_runner.model.link_gpu_experts_cache(self.context.experts_cache)
+
+        # ------------------------------------------------------------------
+        # 2.  Fill the paging / non‑resident part exactly as before
+        # ------------------------------------------------------------------
+        page_size = self.context.policy.eg - num_gpu_experts
+        for layer_idx in range(self.model_config.num_hidden_layers):
             for page_id in range(self.weights_prefetch_num_pages_cpu):
                 start_pos = num_gpu_experts + page_id * page_size
-                gpu_page_id = (i * self.weights_prefetch_num_pages_cpu + page_id) % self.weights_prefetch_num_pages_gpu
-                start_pos_cache = self.context.get_ecache_size() - self.weights_prefetch_num_pages_gpu * page_size + gpu_page_id * page_size
-                self.experts_mapping[i][start_pos : start_pos + page_size] = torch.arange(start_pos_cache, start_pos_cache + page_size, dtype=torch.int64, device="cuda")
-        
-        print(f"[DEBUG] Expert mapping setup complete for all {self.model_config.num_hidden_layers} layers")
+                gpu_page_id = (
+                    layer_idx * self.weights_prefetch_num_pages_cpu + page_id
+                ) % self.weights_prefetch_num_pages_gpu
+                start_pos_cache = (
+                    self.context.get_ecache_size()
+                    - self.weights_prefetch_num_pages_gpu * page_size
+                    + gpu_page_id * page_size
+                )
+                self.experts_mapping[layer_idx][start_pos : start_pos + page_size] = torch.arange(
+                    start_pos_cache,
+                    start_pos_cache + page_size,
+                    dtype=torch.int64,
+                    device="cuda",
+                )
+
+        # ------------------------------------------------------------------
+        # 3.  Console diagnostics
+        # ------------------------------------------------------------------
+        if hot_experts is not None:
+            print("[INFO] Permanent GPU experts selected from activation JSON")
+        print(f"[DEBUG] GPU Experts Initialization complete:")
+        print(f"  • Experts per layer on‑GPU: {num_gpu_experts}")
+        print(f"  • Expert cache size: {self.context.get_ecache_size()} slots")
 
     def delete_gpu_context(self):
         self.context.delete_gpu_context()
