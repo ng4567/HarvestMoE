@@ -1,3 +1,43 @@
+def init_gpu_experts(self):
+        """
+        Populate experts into permanent GPU cache with top-k most active experts for each MoE layer.
+        If `self.activation_json_path` is not None, load the activation json file and populate the experts cache with the top-k most active experts for each MoE layer.
+        If `self.activation_json_path` is None, we fall back to the original "first‑N" strategy.
+        """
+        self.context.init_gpu_experts(self.model_runner.model.get_experts_mem())
+        # link the experts cache to the modelMore actions
+        self.model_runner.model.link_gpu_experts_cache(self.context.experts_cache)
+        num_gpu_experts = int(self.model_config.num_local_experts * self.context.policy.wg)
+
+        hot_experts: dict[int, list[int]] = {}
+
+        with open(self.activation_json_path, "r") as f:
+            activation_data = json.load(f)
+
+            for layer_tag, stats in activation_data.items():
+                layer_idx = int(layer_tag.split('_')[1])        # "layer_31" → 31
+
+                top_k = heapq.nlargest(
+                    num_gpu_experts,            # k
+                    stats.items(),              # (expert_id_str, freq)
+                    key=lambda kv: kv[1],       # sort by frequency
+                )
+
+                hot_experts[layer_idx] = [int(eid) for eid, _ in top_k]
+
+        print("Hot experts:", hot_experts)
+        if num_gpu_experts > 0:
+            for i in range(self.model_config.num_hidden_layers):
+                if i in hot_experts:
+                    # Use hot experts from activation data
+                    hot_expert_ids = hot_experts[i]
+                    self.experts_mapping[i][:num_gpu_experts] = torch.tensor(hot_expert_ids, dtype=torch.int64, device="cuda")
+            else:
+                # Fallback to first N experts if no activation data for this layer
+                self.experts_mapping[i][:num_gpu_experts] = torch.arange(i * num_gpu_experts, (i + 1) * num_gpu_experts, dtype=torch.int64, device="cuda")
+
+        assert self.model_config.num_hidden_layers % 2 == 0
+
 # MoE-Lightning: Artifact Evaluation
 
 This document contains instruction for ASPLOS 2025 artifact evaluation for the paper *MoE-Lightning: High-Throughput MoE Inference on
@@ -40,6 +80,19 @@ pip uninstall torch
 pip install "vllm>=0.2.7,<0.4.1"
 conda install transformers
 ```
+
+
+Before changing cache to factor in frequency:
+
+============================================================
+EXPERT PAGE-IN STATISTICS
+============================================================
+Total Page-in Events: 4993
+============================================================
+
+
+
+
 
 ## Installation
 ```
