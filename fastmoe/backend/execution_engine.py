@@ -67,18 +67,6 @@ class ExecutionEngine:
         self.fg_page_size = self.page_size * 3 * self.model_config.hidden_size
         self.decode_slot_size = self.fg_page_size // self.num_weights_slots_decode
     
-    def get_page_in_count(self):
-        """Get the total number of page-in events.
-        
-        Returns:
-            int: Total number of times expert weights were paged in from CPU to GPU
-        """
-        return self.page_in_counter
-    
-    def reset_page_in_counter(self):
-        """Reset the page-in counter."""
-        self.page_in_counter = 0
-    
     def print_page_in_stats(self):
         """Print page-in statistics."""
         print(f"\n{'='*60}")
@@ -210,12 +198,11 @@ class ExecutionEngine:
             prefetch_gpu_slice = self._get_prefetch_gpu_slice(slot_id, stage)
             prefetch_cpu_slice = self._get_prefetch_cpu_slice(slot_id, stage)
             
-            # Increment page-in counter
-            self.page_in_counter += 1
-            
             with torch.cuda.stream(self.context.prefetch_stream):
                 self.context.experts_cache[prefetch_gpu_slice].copy_(self.model_runner.model.get_experts_mem()[layer_id, prefetch_cpu_slice], non_blocking=True)
                 self.prefetch_events[slot_id].record(self.context.prefetch_stream)
+
+            self.page_in_counter += 1 
         elif stage == 'decode':
             # wait on copy to pin
             self.copy_futures[slot_id].result()
@@ -232,13 +219,12 @@ class ExecutionEngine:
                     None
             )
             
-            # Increment page-in counter (from pin memory to GPU)
-            self.page_in_counter += 1
-            
             with torch.cuda.stream(self.context.load_stream):
                 intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
                 self.context.experts_cache.view(-1, intermediate_size)[prefetch_gpu_slice, :].copy_(self.context.experts_pin.view(-1, intermediate_size)[from_pin_slice, :], non_blocking=True)
                 self.prefetch_events[slot_id].record(self.context.prefetch_stream)
+
+            self.page_in_counter += 1 
     
     def prefetch_experts_to_pin(self, layer_id: int, slot_id: int):
         self.copy_futures[slot_id] = self.context.copy_executor.submit(self.prefetch_experts_to_pin_func, layer_id, slot_id)
@@ -474,9 +460,8 @@ class ExecutionEngine:
 
         self.context.token_to_kv_pool.clear()
         
-        # Reset page-in counter
-        self.reset_page_in_counter()
-
+        self.print_page_in_stats()
+        self.page_in_counter = 0
 
 @dataclass
 class ExecutionContext:

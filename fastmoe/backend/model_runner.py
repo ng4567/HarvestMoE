@@ -15,8 +15,6 @@ import fastmoe
 
 logger = logging.getLogger("model_runner")
 
-
-
 @lru_cache()
 def import_model_classes():
     model_arch_name_to_cls = {}

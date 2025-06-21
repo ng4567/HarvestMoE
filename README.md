@@ -1,3 +1,82 @@
+python -m fastmoe.serve.launch_server --model-path microsoft/Phi-3.5-MoE-instruct --port 30000 --cpu-mem-bdw 76 --avg-prompt-len 77 --gen-len 32
+
+
+conda deactivate && conda activate fastmoe && cd benchmarks/mtbench && python bench.py --port 30000 --max-new-tokens 32 --ubs 324 --n-ub 14
+
+python bench.py --port 30000 --max-new-tokens 32 --ubs 324 --n-ub 14
+
+
+before adding frequency aware caching:
+EXECUTION COMPLETE - Total paging events: 4993
+EXECUTION COMPLETE - Paging events: 4993, Skipped: 0, Savings: 0.0%
+
+
+
+layer_0: activated experts [1, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15]
+layer_0: unactivated experts [0, 2, 9]
+layer_1: activated experts [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13]
+layer_1: unactivated experts [7, 14, 15]
+layer_2: activated experts [0, 1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13, 14, 15]
+layer_2: unactivated experts [6, 9]
+layer_3: activated experts [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 13, 15]
+layer_3: unactivated experts [0, 6, 12, 14]
+layer_4: activated experts [0, 1, 2, 6, 7, 8, 9, 10, 11, 13, 14, 15]
+layer_4: unactivated experts [3, 4, 5, 12]
+layer_5: activated experts [0, 1, 2, 4, 5, 6, 7, 9, 10, 12, 14, 15]
+layer_5: unactivated experts [3, 8, 11, 13]
+layer_6: activated experts [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 13]
+layer_6: unactivated experts [8, 12, 14, 15]
+layer_7: activated experts [2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15]
+layer_7: unactivated experts [0, 1, 8]
+layer_8: activated experts [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14]
+layer_8: unactivated experts [8, 9, 15]
+layer_9: activated experts [0, 1, 2, 4, 5, 7, 9, 10, 11, 12, 13, 14]
+layer_9: unactivated experts [3, 6, 8, 15]
+layer_10: activated experts [0, 1, 2, 3, 4, 6, 7, 8, 12, 15]
+layer_10: unactivated experts [5, 9, 10, 11, 13, 14]
+layer_11: activated experts [0, 2, 5, 6, 7, 10, 11, 12, 13, 14, 15]
+layer_11: unactivated experts [1, 3, 4, 8, 9]
+layer_12: activated experts [0, 1, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15]
+layer_12: unactivated experts [2, 6, 7]
+layer_13: activated experts [0, 3, 5, 6, 7, 9, 11, 12, 13, 14, 15]
+layer_13: unactivated experts [1, 2, 4, 8, 10]
+layer_14: activated experts [1, 3, 4, 6, 8, 9, 11, 12, 14, 15]
+layer_14: unactivated experts [0, 2, 5, 7, 10, 13]
+layer_15: activated experts [0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 14]
+layer_15: unactivated experts [6, 7, 8, 13, 15]
+layer_16: activated experts [0, 1, 4, 5, 7, 8, 9, 10, 11, 12, 13]
+layer_16: unactivated experts [2, 3, 6, 14, 15]
+layer_17: activated experts [0, 1, 2, 3, 4, 7, 9, 10, 12, 13, 14, 15]
+layer_17: unactivated experts [5, 6, 8, 11]
+layer_18: activated experts [0, 2, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14]
+layer_18: unactivated experts [1, 3, 6, 15]
+layer_19: activated experts [3, 5, 6, 9, 11, 12, 13, 14, 15]
+layer_19: unactivated experts [0, 1, 2, 4, 7, 8, 10]
+layer_20: activated experts [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 14, 15]
+layer_20: unactivated experts [0, 9, 11]
+layer_21: activated experts [0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15]
+layer_21: unactivated experts [2, 13]
+layer_22: activated experts [0, 3, 4, 6, 8, 9, 11, 12, 13, 14, 15]
+layer_22: unactivated experts [1, 2, 5, 7, 10]
+layer_23: activated experts [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+layer_23: unactivated experts [4]
+layer_24: activated experts [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+layer_24: unactivated experts [0, 2]
+layer_25: activated experts [0, 1, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 15]
+layer_25: unactivated experts [2, 5, 14]
+layer_26: activated experts [2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15]
+layer_26: unactivated experts [0, 1, 7, 8]
+layer_27: activated experts [0, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15]
+layer_27: unactivated experts [1, 6, 7]
+layer_28: activated experts [2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+layer_28: unactivated experts [0, 1, 4]
+layer_29: activated experts [3, 4, 6, 7, 8, 9, 10, 12, 14]
+layer_29: unactivated experts [0, 1, 2, 5, 11, 13, 15]
+layer_30: activated experts [1, 3, 5, 6, 7, 9, 10, 11, 12, 14, 15]
+layer_30: unactivated experts [0, 2, 4, 8, 13]
+layer_31: activated experts [0, 1, 2, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15]
+layer_31: unactivated experts [3, 10]
+
 def init_gpu_experts(self):
         """
         Populate experts into permanent GPU cache with top-k most active experts for each MoE layer.
@@ -82,18 +161,6 @@ conda install transformers
 ```
 
 
-Before changing cache to factor in frequency:
-
-============================================================
-EXPERT PAGE-IN STATISTICS
-============================================================
-Total Page-in Events: 4993
-============================================================
-
-
-
-
-
 ## Installation
 ```
 git clone -b asplos-artifact https://github.com/caoshiyi/FastMoE.git 
@@ -111,6 +178,7 @@ pip install triton==2.2.0
 The first-time weights loading can take ~10min. Adjust `--gen-len` for different generation configurations.
 S2 (Recommend using GCP g2-standard-48 instance)
 ```
+conda deactivate && conda activate fastmoe
 python -m fastmoe.serve.launch_server --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 --port 30000 --cpu-mem-bdw 76 --avg-prompt-len 77 --gen-len 32
 cd benchmarks/mtbench
 python bench.py --port 30000 --max-new-tokens 32 --ubs 324 --n-ub 14
