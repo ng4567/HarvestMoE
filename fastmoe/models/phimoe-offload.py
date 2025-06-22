@@ -1,5 +1,5 @@
 """Inference-only Phi-3.5 MoE model."""
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set, Dict
 import torch
 from torch import nn
 from transformers import PhiConfig
@@ -98,6 +98,17 @@ class PhiMoE(nn.Module):
         # Store the latest expert routing information for tracking
         self.last_topk_ids = None
 
+        # === Per‑batch activation tracking ===
+        # Dict[layer_id -> set(expert_ids)] for the current forward pass
+        self.batch_activation_sets: Dict[int, Set[int]] = {
+            i: set() for i in range(self.num_layers)
+        }
+
+        self.expert_activation_counts: Dict[int, torch.Tensor] = {
+            i: torch.zeros(self.num_total_experts, dtype = torch.long)
+            for i in range(self.num_layers)
+        }
+
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       weight_name: str, expert_id: int, layer_id: int):
         tp_rank = get_tensor_model_parallel_rank()
@@ -114,6 +125,41 @@ class PhiMoE(nn.Module):
         if weight_name.endswith("w2.weight"):
             param_data[layer_id, expert_id, w2_offset:] = loaded_weight[:, shard].reshape(-1)
 
+    # ------------------------------------------------------------------
+    # Activation‑tracking helpers
+    # ------------------------------------------------------------------
+    def _update_activation_sets(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+        """Merge newly‑active experts into the per‑layer set for this batch."""
+        if topk_ids is None:
+            return
+        # Flatten, move to CPU (cheap metadata op), and convert to Python ints
+        active = set(topk_ids.view(-1).tolist())
+        self.batch_activation_sets[layer_id].update(active)
+    
+    def _increment_activation_counts(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+        """
+        Increment the activation counts for the given layer.
+        """
+        if topk_ids is None:
+            return
+        counts = torch.bincount(topk_ids.view(-1), 
+                                minlength = self.num_total_experts)
+        self.expert_activation_counts[layer_id] += counts
+
+    def reset_activation_sets(self) -> None:
+        """Clear all recorded activations (call once per new batch)."""
+        for k in self.batch_activation_sets:
+            self.batch_activation_sets[k].clear()
+
+    def reset_activation_counts(self) -> None:
+        """Clear all recorded activation counts (call once per new batch)."""
+        for k in self.expert_activation_counts:
+            self.expert_activation_counts[k].zero_()
+
+    def get_activation_sets(self) -> Dict[int, Set[int]]:
+        """Return the dict {layer_id: set(active_expert_ids)}."""
+        return self.batch_activation_sets
+
     def forward(self, index:int, hidden_states: torch.Tensor, experts_cache: torch.Tensor, 
                 input_metadata: Optional[InputMetadata] = None) -> torch.Tensor:
         # Check if we have pre-computed expert assignments
@@ -128,7 +174,11 @@ class PhiMoE(nn.Module):
             
             # Store the expert indices for tracking
             self.last_topk_ids = topk_ids
-            
+
+            # Record activations for this layer
+            self._update_activation_sets(index, self.last_topk_ids)
+            self._increment_activation_counts(index, self.last_topk_ids)
+
             # Get dimensions
             M, H = hidden_states.shape
             _, page_size = self.ws.gpu_cache.shape
@@ -206,6 +256,11 @@ class PhiMoE(nn.Module):
             
             # Store the expert indices for tracking
             self.last_topk_ids = topk_ids
+
+            # Record activations for this layer
+            self._update_activation_sets(index, self.last_topk_ids)
+            # Update cumulative activation histogram
+            self._increment_activation_counts(index, self.last_topk_ids)
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
@@ -735,6 +790,31 @@ class PhiMoEForCausalLMOff(nn.Module):
         # to use these pre-computed values instead of computing them
         return self.forward(input_ids, positions, input_metadata, 
                           hidden_states, residual, cur_layers)
+
+# ------------------------------------------------------------------
+# MoE activation utilities
+# ------------------------------------------------------------------
+    def get_and_print_batch_activation_sets(self):
+        """Return the dict {layer_id: set(active_expert_ids)} collected during the latest forward pass."""
+        set_all_possible_experts = set(range(self.config.num_local_experts))
+        for layer in self.model.block_sparse_moe.batch_activation_sets:
+            print(f"Layer {layer}: activated experts {sorted(list(self.model.block_sparse_moe.batch_activation_sets[layer]))}")
+            print(f"Layer {layer}: unactivated experts {sorted(list(set_all_possible_experts - self.model.block_sparse_moe.batch_activation_sets[layer]))}")
+
+        return self.model.block_sparse_moe.get_activation_sets()
+
+
+    # ------------------------------------------------------------------
+    #  MoE activation count passthrough helpers
+    # ------------------------------------------------------------------
+    @property
+    def expert_activation_counts(self):
+        """Expose the cumulative per-expert activation counters."""
+        return self.model.block_sparse_moe.expert_activation_counts
+
+    def reset_activation_counts(self):
+        """Reset cumulative activation histogram inside the MoE block."""
+        self.model.block_sparse_moe.reset_activation_counts()
 
 
 EntryClass = PhiMoEForCausalLMOff

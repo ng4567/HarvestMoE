@@ -10,7 +10,7 @@ from fastmoe.backend.task import Batch, Req
 from fastmoe.backend.task_meta import ForwardMode, DecodePart
 from fastmoe.backend.utils import HardwareConfig
 from fastmoe.backend.model_runner import ModelRunner
-
+import json
 
 class ExecutionEngine:
     def __init__(self, model_runner: ModelRunner, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int):
@@ -459,9 +459,24 @@ class ExecutionEngine:
         self.num_weights_slots_decode = 0
 
         self.context.token_to_kv_pool.clear()
-        
+
         self.print_page_in_stats()
         self.page_in_counter = 0
+
+        # print("******Expert Activation Stats******\n")
+        # self.model_runner.model.get_and_print_batch_activation_sets()
+        # print("\n")
+        
+        # json_payload = {}
+        # print("******Expert Activation Counts******\n")
+        # for layer, tensor in self.model_runner.model.expert_activation_counts.items():
+        #     counts = tensor.cpu().tolist()
+        #     json_payload[f"layer_{layer}"] = {str(i): int(c) for i, c in enumerate(counts)}
+
+        # with open("test_bench_activation_counts.json", "w") as f:
+        #     json.dump(json_payload, f, indent=2)
+
+        # self.model_runner.model.reset_activation_counts()
 
 @dataclass
 class ExecutionContext:
