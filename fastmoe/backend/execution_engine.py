@@ -48,8 +48,13 @@ class ExecutionEngine:
         self.weights_prefetch_num_pages_cpu = self.model_config.num_local_experts // self.context.policy.eg
         self.weights_prefetch_num_pages_gpu = 2
 
-        # experts cache mapping: experts_id -> idx in self.context.experts_cache
-        self.experts_mapping = [torch.empty(self.model_config.num_local_experts, dtype=torch.int64, device="cuda") for _ in range(self.model_config.num_hidden_layers)]
+        # mapping must live on the same device as hidden_states (cuda:0) for Triton kernel
+        self.experts_mapping = [
+            torch.empty(self.model_config.num_local_experts,
+                        dtype=torch.int64,
+                        device="cuda:0")
+            for _ in range(self.model_config.num_hidden_layers)
+        ]
     
     def init_weights_prefetch_meta(self):
 
@@ -66,6 +71,9 @@ class ExecutionEngine:
         self.num_weights_slots_decode = len(self.micro_batches)
         self.fg_page_size = self.page_size * 3 * self.model_config.hidden_size
         self.decode_slot_size = self.fg_page_size // self.num_weights_slots_decode
+        # Add: store slot size in rows for decode
+        intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
+        self.decode_slot_rows = self.decode_slot_size
     
     def print_page_in_stats(self):
         """Print page-in statistics."""
@@ -76,7 +84,8 @@ class ExecutionEngine:
         print(f"{'='*60}\n")
     
     def _get_prefetch_cpu_slice(self, slot_id: int, stage: str):
-        page_id = self.weights_prefetch_page_cpu
+        page_id = (self.weights_prefetch_page_cpu + getattr(self, "pinned_pages_per_layer", 0)) \
+                  % self.weights_prefetch_num_pages_cpu
         if stage == 'prefill':
             cpu_start_pos = (self.num_experts_gpu 
                     + page_id * self.page_size 
@@ -84,17 +93,20 @@ class ExecutionEngine:
             self.weights_prefetch_page_cpu = (self.weights_prefetch_page_cpu + 1) % self.weights_prefetch_num_pages_cpu
             return slice(cpu_start_pos, cpu_start_pos + self.prefill_slot_size)
         elif stage == 'decode':
-            cpu_start_pos = (self.num_experts_gpu * 3 * self.model_config.hidden_size 
-                    + page_id * self.fg_page_size 
-                    + slot_id * self.decode_slot_size)
+            # row-based indexing (each row has `intermediate_size` elements)
+            intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
+            cpu_start_row = (self.num_experts_gpu
+                             + page_id * self.page_size
+                             + slot_id * self.decode_slot_rows)
             if slot_id == self.num_weights_slots_decode - 1:
                 self.weights_prefetch_page_cpu = (self.weights_prefetch_page_cpu + 1) % self.weights_prefetch_num_pages_cpu
-                return slice(cpu_start_pos, None)
+                return slice(cpu_start_row, None)
             else:
-                return slice(cpu_start_pos, cpu_start_pos + self.decode_slot_size)
+                return slice(cpu_start_row, cpu_start_row + self.decode_slot_rows)
     
     def _get_prefetch_gpu_slice(self, slot_id: int, stage: str):
-        page_id = self.weights_prefetch_page_gpu
+        page_id = (self.weights_prefetch_page_gpu + getattr(self, "pinned_pages_per_layer", 0)) \
+                  % self.weights_prefetch_num_pages_gpu
         if stage == 'prefill':
             gpu_start_pos = (self.context.get_ecache_size() 
                         - self.weights_prefetch_num_pages_gpu * self.page_size 
@@ -199,7 +211,9 @@ class ExecutionEngine:
             prefetch_cpu_slice = self._get_prefetch_cpu_slice(slot_id, stage)
             
             with torch.cuda.stream(self.context.prefetch_stream):
-                self.context.experts_cache[prefetch_gpu_slice].copy_(self.model_runner.model.get_experts_mem()[layer_id, prefetch_cpu_slice], non_blocking=True)
+                self.context.experts_cache[prefetch_gpu_slice].copy_(
+                self.context.experts_cache_cold[prefetch_cpu_slice],   # ← on cuda:1
+                non_blocking=True)
                 self.prefetch_events[slot_id].record(self.context.prefetch_stream)
 
             self.page_in_counter += 1 
@@ -208,16 +222,17 @@ class ExecutionEngine:
             self.copy_futures[slot_id].result()
             assert(slot_id < self.num_weights_slots_decode) 
             prefetch_gpu_slice = self._get_prefetch_gpu_slice(slot_id, stage)
+            # Use row-based indices for from_pin_slice
             if slot_id != self.num_weights_slots_decode - 1:
                 from_pin_slice = slice(
-                    slot_id * self.decode_slot_size, 
-                    (slot_id + 1) * self.decode_slot_size
+                    slot_id * self.decode_slot_rows, 
+                    (slot_id + 1) * self.decode_slot_rows
                 )
             else:
                 from_pin_slice = slice(
-                    slot_id * self.decode_slot_size, 
+                    slot_id * self.decode_slot_rows, 
                     None
-            )
+                )
             
             with torch.cuda.stream(self.context.load_stream):
                 intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
@@ -230,29 +245,31 @@ class ExecutionEngine:
         self.copy_futures[slot_id] = self.context.copy_executor.submit(self.prefetch_experts_to_pin_func, layer_id, slot_id)
 
     def prefetch_experts_to_pin_func(self, layer_id: int, slot_id: int):
+        # wait until the previous prefetch into GPU cache is done
         self.prefetch_events[slot_id].synchronize()
-        
-        intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
-        experts_pin = self.context.experts_pin.view(-1, 
-                                                    intermediate_size)
-        experts_cpu = (self.model_runner.model.get_experts_mem()
-                       .view(self.model_config.num_hidden_layers, 
-                            -1, 
-                            intermediate_size))
-        prefetch_cpu_slice = self._get_prefetch_cpu_slice(slot_id, 'decode')
-        if slot_id != self.num_weights_slots_decode - 1:
-            to_pin_slice = slice(
-                slot_id * self.decode_slot_size, 
-                (slot_id + 1) * self.decode_slot_size
-            )
-        else:
-            to_pin_slice = slice(
-                slot_id * self.decode_slot_size, 
-                None
-            )
 
-        experts_pin[to_pin_slice, :].copy_(experts_cpu[layer_id, prefetch_cpu_slice, :])
-        print(f"Prefetch experts to pin: layer {layer_id}, slot {slot_id}")
+        # compute flat views for pin and cold caches
+        intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
+        experts_pin_flat = self.context.experts_pin.view(-1, intermediate_size)
+        experts_cache_cold_flat = self.context.experts_cache_cold.view(-1, intermediate_size)
+
+        # determine start and end row indices for this slot (fixed length)
+        start = slot_id * self.decode_slot_rows
+        # end is start + slot length, clamped to pin size
+        total_rows = experts_pin_flat.shape[0]
+        end = start + self.decode_slot_rows if slot_id != self.num_weights_slots_decode - 1 else total_rows
+
+        # perform the copy with fixed-length slice from cold cache
+        cpu_slice = self._get_prefetch_cpu_slice(slot_id, 'decode')
+        cpu_start = cpu_slice.start
+        length = end - start
+        dst = experts_pin_flat[start:end, :]
+        src = experts_cache_cold_flat[cpu_start:cpu_start + length, :]
+        assert dst.shape == src.shape, f"shape mismatch: dst={dst.shape}, src={src.shape}"
+        dst.copy_(src, non_blocking=True)
+
+        # optional debug
+        print(f"Prefetch experts to pin: slot {slot_id}")
     
     def offload_kv_cache(self, layer_id: int, batch_id: int):
         with torch.cuda.stream(self.context.offload_stream):
@@ -280,7 +297,7 @@ class ExecutionEngine:
 
     # read: weights, write: kvcache, 
     def layer(self, layer_id: int, page_id: int, batch_id: int):
-        print("Prefill layer: ", layer_id, "batch: ", batch_id)
+        print("Prefill layer: ", layer_id, "batch: ", batch_id)        
         # wait on prefetch weights, load hidden and offload kv cache of the same cacheline
         batch = self.micro_batches[batch_id]
         if batch_id == 0:
@@ -295,16 +312,22 @@ class ExecutionEngine:
         else:
             if layer_id < self.model_config.num_hidden_layers - 1:
                 batch.hidden_states, batch.residual = self.model_runner.prefill(
-                    batch, DecodePart.ALL, 
-                    layer_id, self.experts_mapping[layer_id],
-                    batch.return_logprob, self.attn_events[batch_id]
+                    batch=batch,
+                    decode_part=DecodePart.ALL,
+                    layer_id=layer_id,
+                    experts_mapping=self.experts_mapping[layer_id],
+                    return_logprob=batch.return_logprob,
+                    attn_event=self.attn_events[batch_id],
                 )
             else:
                 # last layer forward
                 logits, (logprobs, normalized_logprobs) = self.model_runner.prefill(
-                    batch, DecodePart.ALL, layer_id,
-                    self.experts_mapping[layer_id],
-                    batch.return_logprob, self.attn_events[batch_id]
+                    batch=batch,
+                    decode_part=DecodePart.ALL,
+                    layer_id=layer_id,
+                    experts_mapping=self.experts_mapping[layer_id],
+                    return_logprob=batch.return_logprob,
+                    attn_event=self.attn_events[batch_id],
                 )
                 if logprobs is not None:
                     logprobs = logprobs.cpu().tolist()
@@ -371,14 +394,16 @@ class ExecutionEngine:
         self.load_hidden_events[batch_id].wait(self.context.cur_stream)
         if layer_id < self.model_config.num_hidden_layers - 1:
             batch.hidden_states, batch.residual = self.model_runner.post_attn(
-                batch, DecodePart.POSTATTN, layer_id, self.experts_mapping[layer_id]
+                batch, DecodePart.POSTATTN, layer_id,
+                experts_mapping=self.experts_mapping[layer_id],
             )
         else:
             # last layer forward
-            logits, _ = self.model_runner.post_attn(batch, 
-                                                  DecodePart.POSTATTN, 
-                                                  layer_id, 
-                                                  self.experts_mapping[layer_id])
+            logits, _ = self.model_runner.post_attn(
+                batch, DecodePart.POSTATTN,
+                layer_id,
+                experts_mapping=self.experts_mapping[layer_id],
+            )
             next_token_ids, next_token_probs = batch.sample(logits)
             next_token_ids = next_token_ids.cpu().tolist()
             print("Next token ids: ", next_token_ids)
@@ -420,24 +445,109 @@ class ExecutionEngine:
                     return None, None
 
     def init_gpu_experts(self):
-        self.context.init_gpu_experts(self.model_runner.model.get_experts_mem())
-        # link the experts cache to the model
-        self.model_runner.model.link_gpu_experts_cache(self.context.experts_cache)
-        num_gpu_experts = int(self.model_config.num_local_experts * self.context.policy.wg)
-        if num_gpu_experts > 0:
-            for i in range(self.model_config.num_hidden_layers):
-                self.experts_mapping[i][:num_gpu_experts] = torch.arange(i * num_gpu_experts, (i + 1) * num_gpu_experts, dtype=torch.int64, device="cuda")
-        
-        assert self.model_config.num_hidden_layers % 2 == 0
-        
+        """
+        Populate the permanent‑GPU expert cache with the *num_gpu_experts*
+        most‑frequently activated experts **per layer**, based on the cumulative
+        histogram in `self.model_runner.model.expert_activation_counts`.
+
+        After pinning the hot experts, we fill `self.experts_mapping` so that
+        every expert ID knows its location (either the permanent region or one
+        of the rotating GPU pages used during prefetch).
+        """
+        # ------------------------------------------------------------------
+        # 1. Convenience handles
+        # ------------------------------------------------------------------
+        cpu_experts_mem = self.model_runner.model.get_experts_mem()     # [L, E, …]
+        ecache          = self.context.experts_cache                    # [L * N + buffers, …]
+        self.model_runner.model.link_gpu_experts_cache(ecache)
+
+        # ------------------------------------------------------------------
+        # 0‑b. Allocate a mirror cache on GPU 1 for cold experts (once)
+        # ------------------------------------------------------------------
+        if not hasattr(self.context, "experts_cache_cold"):
+            # Exact same shape as the hot cache but resident on cuda:1
+            self.context.experts_cache_cold = torch.empty_like(
+                self.context.experts_cache, device="cuda:1"
+            )
+        L = self.model_config.num_hidden_layers
+        E = self.model_config.num_local_experts
+        num_gpu_experts = int(E * self.context.policy.wg)               # N
+        if num_gpu_experts == 0:
+            return  # nothing to pin permanently
+
         num_comp_experts = self.context.policy.eg
         page_size = num_comp_experts - num_gpu_experts
-        for i in range(self.model_config.num_hidden_layers):
-            for page_id in range(self.weights_prefetch_num_pages_cpu):
-                start_pos = num_gpu_experts + page_id * page_size
-                gpu_page_id = (i * self.weights_prefetch_num_pages_cpu + page_id) % self.weights_prefetch_num_pages_gpu
-                start_pos_cache = self.context.get_ecache_size() - self.weights_prefetch_num_pages_gpu * page_size + gpu_page_id * page_size
-                self.experts_mapping[i][start_pos : start_pos + page_size] = torch.arange(start_pos_cache, start_pos_cache + page_size, dtype=torch.int64, device="cuda")
+        self.pinned_pages_per_layer = num_gpu_experts // page_size if page_size > 0 else 0
+
+        # ------------------------------------------------------------------
+        # Read cumulative activation counts from JSON written in prior runs
+        # ------------------------------------------------------------------
+        json_path = "/home/azureuser/moe-lightning-fork-new/test_bench_activation_counts.json"
+        with open(json_path, "r") as jf:
+            json_hist = json.load(jf)
+
+        # json_hist keys look like "layer_0", values are either a list or a
+        # dict {"0": count0, "1": count1, …}.  Convert to {layer_id: tensor[E]}.
+        act_hist = {}
+        for layer_key, payload in json_hist.items():
+            layer_id = int(layer_key.split("_")[1])
+            if isinstance(payload, list):
+                counts_list = payload
+            else:  # dict-of‑strings
+                counts_list = [payload[str(eid)] for eid in range(E)]
+            act_hist[layer_id] = torch.tensor(counts_list, dtype=torch.long)
+
+        # ------------------------------------------------------------------
+        # 2. Copy the top‑N experts of each layer into the *front* of ecache
+        #    layout:  [layer0‑expert0 … layer0‑expertN‑1 |
+        #              layer1‑expert0 … layer1‑expertN‑1 | …]
+        # ------------------------------------------------------------------
+        # number of whole pages the permanent hot cache already covers
+        assert page_size >= 0, "policy.eg must be ≥ num_gpu_experts"
+        for layer in range(L):
+            # --- 2‑a. Pick the hottest experts --------------------------------
+            hot_ids = torch.topk(
+                act_hist[layer].cpu(),      # tensor[E]
+                k=num_gpu_experts,
+                largest=True
+            ).indices.tolist()
+
+            # --- 2‑b. Copy weights -------------------------------------------
+            base = layer * num_gpu_experts
+            for slot, expert_id in enumerate(hot_ids):
+                ecache[base + slot].copy_(cpu_experts_mem[layer, expert_id])
+                self.experts_mapping[layer][expert_id] = base + slot  # gpu‑0 slot
+
+            # --- NEW: copy COLD experts to GPU‑1 --------------------------------
+            cold_ids = [eid for eid in range(E) if eid not in hot_ids]
+            for expert_id in cold_ids:
+                flat_idx = layer * num_gpu_experts + expert_id  # same flattened index space
+                self.context.experts_cache_cold[flat_idx].copy_(
+                    cpu_experts_mem[layer, expert_id]
+                )
+
+            # ------------------------------------------------------------------
+            # 3. For cold experts, fall back to the original page‑mapping scheme
+            #    Each page gets `page_size` experts; the GPU holds 2 pages that
+            #    rotate during prefetch.  We reuse the old math that maps
+            #    page‑id -> slice in ecache.
+            # ------------------------------------------------------------------
+            num_comp_experts = self.context.policy.eg
+            page_size        = num_comp_experts - num_gpu_experts
+            assert page_size >= 0, "policy.eg must be ≥ num_gpu_experts"
+
+            for local_idx, expert_id in enumerate(cold_ids):
+                page_id      = local_idx // page_size
+                offset_in_pg = local_idx %  page_size
+                gpu_page_id  = (layer * self.weights_prefetch_num_pages_cpu + page_id) % self.weights_prefetch_num_pages_gpu
+
+                start_pos_cache = (
+                    self.context.get_ecache_size()
+                    - self.weights_prefetch_num_pages_gpu * page_size
+                    + gpu_page_id * page_size
+                )
+                ecache_idx = start_pos_cache + offset_in_pg
+                self.experts_mapping[layer][expert_id] = ecache_idx
 
     def delete_gpu_context(self):
         self.context.delete_gpu_context()
@@ -486,6 +596,7 @@ class ExecutionContext:
 
     # experts cache on gpu
     experts_cache: torch.tensor
+    experts_cache_cold: torch.tensor
 
     # cpu pinned relay
     qkv_pin: List[torch.tensor]
@@ -550,12 +661,20 @@ class ExecutionContext:
         # if we have enough GPU memory, the buffer is 2 * (num_experts - num_experts_gpu)
         # elif we do not have enough GPU memory, the buffer is of size 2 * num_comp_experts
         experts_pool_size  = num_layers * num_experts_gpu + 2 * (num_comp_experts - num_experts_gpu)
-        intermediate_size = model_config.intermediate_size // hardware_config.tp_size
-        experts_cache = torch.empty(experts_pool_size, 3 * intermediate_size * model_config.hidden_size, dtype=torch.get_default_dtype(), device="cuda")
 
-        experts_pin = torch.empty(((num_comp_experts - num_experts_gpu), 
-                                    3 * intermediate_size * model_config.hidden_size), 
-                                    dtype=torch.get_default_dtype(), device="cpu").pin_memory()
+        intermediate_size = model_config.intermediate_size // hardware_config.tp_size
+        elem_dim = 3 * intermediate_size * model_config.hidden_size
+
+        experts_cache  = torch.empty(experts_pool_size, elem_dim,
+                                    dtype=torch.get_default_dtype(), device="cuda:0")
+
+        experts_cache_cold = torch.empty_like(experts_cache, device="cuda:1")
+
+        
+
+        experts_pin = torch.empty(((num_comp_experts - num_experts_gpu),
+                           3 * intermediate_size * model_config.hidden_size),
+                           dtype=torch.get_default_dtype(), device="cuda:1")
 
         num_q_heads = model_config.num_attention_heads // hardware_config.tp_size
         n_kv_heads = model_config.num_key_value_heads // hardware_config.tp_size
@@ -588,6 +707,7 @@ class ExecutionContext:
                    policy=policy,
                    token_to_kv_pool=token_to_kv_pool,
                    experts_cache=experts_cache,
+                   experts_cache_cold=experts_cache_cold,
                    qkv_pin=qkv_pin,
                    hidden_pin=hidden_pin,
                    experts_pin=experts_pin,
