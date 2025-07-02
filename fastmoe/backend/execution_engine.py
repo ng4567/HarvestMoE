@@ -1,4 +1,5 @@
 import torch
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List
@@ -18,6 +19,12 @@ class ExecutionEngine:
         self.model_config = model_config
         self.hardware_config = hardware_config
         self.context = ExecutionContext.build_context(model_config, hardware_config, avg_prompt_len, gen_len)
+        # experts cache mapping: experts_id -> idx in self.context.experts_cache
+        self.experts_mapping = [torch.empty(self.model_config.num_local_experts, dtype=torch.int64, device="cuda") for _ in range(self.model_config.num_hidden_layers)]
+        # track whether gpu cache has been linked to avoid duplicate linking
+        self._gpu_cache_linked = False
+        # Initialize permanent hot‑expert permacache
+        self.init_gpu_experts()
         self.micro_batches: List[Batch] = None
 
         # sync primititves
@@ -45,8 +52,6 @@ class ExecutionEngine:
         self.weights_prefetch_num_pages_cpu = self.model_config.num_local_experts // self.context.policy.eg
         self.weights_prefetch_num_pages_gpu = 2
 
-        # experts cache mapping: experts_id -> idx in self.context.experts_cache
-        self.experts_mapping = [torch.empty(self.model_config.num_local_experts, dtype=torch.int64, device="cuda") for _ in range(self.model_config.num_hidden_layers)]
     
     def init_weights_prefetch_meta(self):
 
@@ -187,7 +192,9 @@ class ExecutionEngine:
             prefetch_gpu_slice = self._get_prefetch_gpu_slice(slot_id, stage)
             prefetch_cpu_slice = self._get_prefetch_cpu_slice(slot_id, stage)
             with torch.cuda.stream(self.context.prefetch_stream):
-                self.context.experts_cache[prefetch_gpu_slice].copy_(self.model_runner.model.get_experts_mem()[layer_id, prefetch_cpu_slice], non_blocking=True)
+                self.context.experts_cache[prefetch_gpu_slice].copy_(
+                    self.model_runner.model.get_experts_mem()[layer_id, prefetch_cpu_slice],
+                    non_blocking=True)
                 self.prefetch_events[slot_id].record(self.context.prefetch_stream)
         elif stage == 'decode':
             # wait on copy to pin
@@ -439,40 +446,41 @@ class ExecutionEngine:
                     return None, None
 
     def init_gpu_experts(self):
-        self.context.init_gpu_experts(self.model_runner.model.get_experts_mem())
-        # link the experts cache to the model
-        self.model_runner.model.link_gpu_experts_cache(self.context.experts_cache)
-        num_gpu_experts = int(self.model_config.num_local_experts * self.context.policy.wg)
-        
-        # DEBUG: Print GPU experts initialization details
-        print(f"[DEBUG] GPU Experts Initialization:")
-        print(f"  - Experts permanently on GPU: {num_gpu_experts}")
-        print(f"  - Expert cache size: {self.context.get_ecache_size()} slots")
-        
-        if num_gpu_experts > 0:
-            for i in range(self.model_config.num_hidden_layers):
-                self.experts_mapping[i][:num_gpu_experts] = torch.arange(i * num_gpu_experts, (i + 1) * num_gpu_experts, dtype=torch.int64, device="cuda")
-            print(f"  - GPU expert mapping initialized for {self.model_config.num_hidden_layers} layers")
-        
-        assert self.model_config.num_hidden_layers % 2 == 0
-        
-        num_comp_experts = self.context.policy.eg
-        page_size = num_comp_experts - num_gpu_experts
-        
-        # DEBUG: Print paging details
-        print(f"[DEBUG] Expert Paging Configuration:")
-        print(f"  - Page size (experts per page): {page_size}")
-        print(f"  - CPU prefetch pages: {self.weights_prefetch_num_pages_cpu}")
-        print(f"  - GPU prefetch pages: {self.weights_prefetch_num_pages_gpu}")
-        
-        for i in range(self.model_config.num_hidden_layers):
-            for page_id in range(self.weights_prefetch_num_pages_cpu):
-                start_pos = num_gpu_experts + page_id * page_size
-                gpu_page_id = (i * self.weights_prefetch_num_pages_cpu + page_id) % self.weights_prefetch_num_pages_gpu
-                start_pos_cache = self.context.get_ecache_size() - self.weights_prefetch_num_pages_gpu * page_size + gpu_page_id * page_size
-                self.experts_mapping[i][start_pos : start_pos + page_size] = torch.arange(start_pos_cache, start_pos_cache + page_size, dtype=torch.int64, device="cuda")
-        
-        print(f"[DEBUG] Expert mapping setup complete for all {self.model_config.num_hidden_layers} layers")
+        cpu_experts_mem = self.model_runner.model.get_experts_mem()
+        # Link GPU cache into the model, once
+        if not self._gpu_cache_linked:
+            self.model_runner.model.link_gpu_experts_cache(self.context.experts_cache)
+            self._gpu_cache_linked = True
+
+        L = self.model_config.num_hidden_layers
+        E = self.model_config.num_local_experts
+        num_gpu_experts = int(E * self.context.policy.wg)
+        if num_gpu_experts == 0:
+            return
+
+        # Load activation histogram from JSON
+        json_path = "test_bench_activation_counts.json"
+        with open(json_path, "r") as jf:
+            json_hist = json.load(jf)
+
+        # Convert to per-layer tensor
+        act_hist = {}
+        for layer_key, payload in json_hist.items():
+            layer_id = int(layer_key.split("_")[1])
+            if isinstance(payload, list):
+                counts = payload
+            else:
+                counts = [payload[str(e)] for e in range(E)]
+            act_hist[layer_id] = torch.tensor(counts, dtype=torch.long)
+
+        # Pin the hottest experts per layer
+        for layer in range(L):
+            hot_ids = torch.topk(act_hist[layer], k=num_gpu_experts, largest=True).indices.tolist()
+            base = layer * num_gpu_experts
+            for slot, expert_id in enumerate(hot_ids):
+                # Copy the expert weights into the front of the cache
+                self.context.experts_cache[base + slot].copy_(cpu_experts_mem[layer, expert_id])
+                self.experts_mapping[layer][expert_id] = base + slot
 
     def delete_gpu_context(self):
         self.context.delete_gpu_context()
@@ -617,7 +625,6 @@ class ExecutionContext:
         cur_stream = torch.cuda.current_stream()
         offload_kv_events = [torch.cuda.Event() for _ in range(2)]
         
-
 
         return cls(model_config=model_config,
                    policy=policy,
