@@ -46,7 +46,12 @@ class ExecutionEngine:
         self.weights_prefetch_num_pages_gpu = 2
 
         # experts cache mapping: experts_id -> idx in self.context.experts_cache
-        self.experts_mapping = [torch.empty(self.model_config.num_local_experts, dtype=torch.int64, device="cuda") for _ in range(self.model_config.num_hidden_layers)]
+        self.experts_mapping = [
+            torch.empty(self.model_config.num_local_experts,
+                        dtype=torch.int64,
+                        device="cuda:0")
+            for _ in range(self.model_config.num_hidden_layers)
+        ]
     
     def init_weights_prefetch_meta(self):
 
@@ -63,9 +68,13 @@ class ExecutionEngine:
         self.num_weights_slots_decode = len(self.micro_batches)
         self.fg_page_size = self.page_size * 3 * self.model_config.hidden_size
         self.decode_slot_size = self.fg_page_size // self.num_weights_slots_decode
-    
+
+        intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
+        self.decode_slot_rows = self.decode_slot_size
+
     def _get_prefetch_cpu_slice(self, slot_id: int, stage: str):
-        page_id = self.weights_prefetch_page_cpu
+        page_id = (self.weights_prefetch_page_cpu + getattr(self, "pinned_pages_per_layer", 0)) \
+                  % self.weights_prefetch_num_pages_cpu
         if stage == 'prefill':
             cpu_start_pos = (self.num_experts_gpu 
                     + page_id * self.page_size 
@@ -73,17 +82,20 @@ class ExecutionEngine:
             self.weights_prefetch_page_cpu = (self.weights_prefetch_page_cpu + 1) % self.weights_prefetch_num_pages_cpu
             return slice(cpu_start_pos, cpu_start_pos + self.prefill_slot_size)
         elif stage == 'decode':
-            cpu_start_pos = (self.num_experts_gpu * 3 * self.model_config.hidden_size 
-                    + page_id * self.fg_page_size 
-                    + slot_id * self.decode_slot_size)
+            # row-based indexing (each row has `intermediate_size` elements)
+            intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
+            cpu_start_row = (self.num_experts_gpu
+                             + page_id * self.page_size
+                             + slot_id * self.decode_slot_rows)
             if slot_id == self.num_weights_slots_decode - 1:
                 self.weights_prefetch_page_cpu = (self.weights_prefetch_page_cpu + 1) % self.weights_prefetch_num_pages_cpu
-                return slice(cpu_start_pos, None)
+                return slice(cpu_start_row, None)
             else:
-                return slice(cpu_start_pos, cpu_start_pos + self.decode_slot_size)
+                return slice(cpu_start_row, cpu_start_row + self.decode_slot_rows)
     
     def _get_prefetch_gpu_slice(self, slot_id: int, stage: str):
-        page_id = self.weights_prefetch_page_gpu
+        page_id = (self.weights_prefetch_page_gpu + getattr(self, "pinned_pages_per_layer", 0)) \
+                  % self.weights_prefetch_num_pages_gpu
         if stage == 'prefill':
             gpu_start_pos = (self.context.get_ecache_size() 
                         - self.weights_prefetch_num_pages_gpu * self.page_size 
@@ -106,7 +118,6 @@ class ExecutionEngine:
                 return slice(gpu_start_pos, gpu_start_pos + self.decode_slot_size)
 
 
-    
     def create_micro_batches(self, req_queue: List[Req]):     
         abort_requests: List[Req] = []
         micro_batches = []
@@ -186,57 +197,66 @@ class ExecutionEngine:
             assert(page_id == self.weights_prefetch_page_cpu)
             prefetch_gpu_slice = self._get_prefetch_gpu_slice(slot_id, stage)
             prefetch_cpu_slice = self._get_prefetch_cpu_slice(slot_id, stage)
+            
             with torch.cuda.stream(self.context.prefetch_stream):
-                self.context.experts_cache[prefetch_gpu_slice].copy_(self.model_runner.model.get_experts_mem()[layer_id, prefetch_cpu_slice], non_blocking=True)
+                self.context.experts_cache[prefetch_gpu_slice].copy_(
+                self.context.experts_cache_cold[prefetch_cpu_slice],   # ← on cuda:1
+                non_blocking=True)
                 self.prefetch_events[slot_id].record(self.context.prefetch_stream)
+
         elif stage == 'decode':
             # wait on copy to pin
             self.copy_futures[slot_id].result()
             assert(slot_id < self.num_weights_slots_decode) 
             prefetch_gpu_slice = self._get_prefetch_gpu_slice(slot_id, stage)
+            # Use row-based indices for from_pin_slice
             if slot_id != self.num_weights_slots_decode - 1:
                 from_pin_slice = slice(
-                    slot_id * self.decode_slot_size, 
-                    (slot_id + 1) * self.decode_slot_size
+                    slot_id * self.decode_slot_rows, 
+                    (slot_id + 1) * self.decode_slot_rows
                 )
             else:
                 from_pin_slice = slice(
-                    slot_id * self.decode_slot_size, 
+                    slot_id * self.decode_slot_rows, 
                     None
-            )
+                )
+            
             with torch.cuda.stream(self.context.load_stream):
                 intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
                 self.context.experts_cache.view(-1, intermediate_size)[prefetch_gpu_slice, :].copy_(self.context.experts_pin.view(-1, intermediate_size)[from_pin_slice, :], non_blocking=True)
                 self.prefetch_events[slot_id].record(self.context.prefetch_stream)
+
     
     def prefetch_experts_to_pin(self, layer_id: int, slot_id: int):
         self.copy_futures[slot_id] = self.context.copy_executor.submit(self.prefetch_experts_to_pin_func, layer_id, slot_id)
 
     def prefetch_experts_to_pin_func(self, layer_id: int, slot_id: int):
+        # wait until the previous prefetch into GPU cache is done
         self.prefetch_events[slot_id].synchronize()
-        
-        intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
-        experts_pin = self.context.experts_pin.view(-1, 
-                                                    intermediate_size)
-        experts_cpu = (self.model_runner.model.get_experts_mem()
-                       .view(self.model_config.num_hidden_layers, 
-                            -1, 
-                            intermediate_size))
-        prefetch_cpu_slice = self._get_prefetch_cpu_slice(slot_id, 'decode')
-        if slot_id != self.num_weights_slots_decode - 1:
-            to_pin_slice = slice(
-                slot_id * self.decode_slot_size, 
-                (slot_id + 1) * self.decode_slot_size
-            )
-        else:
-            to_pin_slice = slice(
-                slot_id * self.decode_slot_size, 
-                None
-            )
 
-        experts_pin[to_pin_slice, :].copy_(experts_cpu[layer_id, prefetch_cpu_slice, :])
-        print(f"Prefetch experts to pin: layer {layer_id}, slot {slot_id}")
-    
+        # compute flat views for pin and cold caches
+        intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
+        experts_pin_flat = self.context.experts_pin.view(-1, intermediate_size)
+        experts_cache_cold_flat = self.context.experts_cache_cold.view(-1, intermediate_size)
+
+        # determine start and end row indices for this slot (fixed length)
+        start = slot_id * self.decode_slot_rows
+        # end is start + slot length, clamped to pin size
+        total_rows = experts_pin_flat.shape[0]
+        end = start + self.decode_slot_rows if slot_id != self.num_weights_slots_decode - 1 else total_rows
+
+        # perform the copy with fixed-length slice from cold cache
+        cpu_slice = self._get_prefetch_cpu_slice(slot_id, 'decode')
+        cpu_start = cpu_slice.start
+        length = end - start
+        dst = experts_pin_flat[start:end, :]
+        src = experts_cache_cold_flat[cpu_start:cpu_start + length, :]
+        assert dst.shape == src.shape, f"shape mismatch: dst={dst.shape}, src={src.shape}"
+        dst.copy_(src, non_blocking=True)
+
+        # optional debug
+        print(f"Prefetch experts to pin: slot {slot_id}")
+
     def offload_kv_cache(self, layer_id: int, batch_id: int):
         with torch.cuda.stream(self.context.offload_stream):
             self.attn_events[batch_id].wait(self.context.offload_stream)
@@ -504,6 +524,7 @@ class ExecutionContext:
 
     # experts cache on gpu
     experts_cache: torch.tensor
+    experts_cache_cold: torch.tensor
 
     # cpu pinned relay
     qkv_pin: List[torch.tensor]
@@ -577,21 +598,20 @@ class ExecutionContext:
         # if we have enough GPU memory, the buffer is 2 * (num_experts - num_experts_gpu)
         # elif we do not have enough GPU memory, the buffer is of size 2 * num_comp_experts
         experts_pool_size  = num_layers * num_experts_gpu + 2 * (num_comp_experts - num_experts_gpu)
+
         intermediate_size = model_config.intermediate_size // hardware_config.tp_size
-        experts_cache = torch.empty(experts_pool_size, 3 * intermediate_size * model_config.hidden_size, dtype=torch.get_default_dtype(), device="cuda")
+        elem_dim = 3 * intermediate_size * model_config.hidden_size
+
+        experts_cache  = torch.empty(experts_pool_size, elem_dim,
+                                    dtype=torch.get_default_dtype(), device="cuda:0")
+
+        experts_cache_cold = torch.empty_like(experts_cache, device="cuda:1")
+
+        experts_pin = torch.empty(((num_comp_experts - num_experts_gpu),
+                           3 * intermediate_size * model_config.hidden_size),
+                           dtype=torch.get_default_dtype(), device="cuda:1")
         
-        # DEBUG: Print memory allocation details
-        expert_memory_per_expert_gb = (3 * intermediate_size * model_config.hidden_size * 2) / (1024**3)  # assuming fp16
-        total_experts_cache_gb = (experts_pool_size * 3 * intermediate_size * model_config.hidden_size * 2) / (1024**3)
-        print(f"[DEBUG] Expert Memory Allocation:")
-        print(f"  - Memory per expert: {expert_memory_per_expert_gb:.3f} GB")
-        print(f"  - Total experts cache pool size: {experts_pool_size} expert slots")
-        print(f"  - Total GPU expert cache memory: {total_experts_cache_gb:.3f} GB")
-
-        experts_pin = torch.empty(((num_comp_experts - num_experts_gpu), 
-                                    3 * intermediate_size * model_config.hidden_size), 
-                                    dtype=torch.get_default_dtype(), device="cpu").pin_memory()
-
+        
         num_q_heads = model_config.num_attention_heads // hardware_config.tp_size
         n_kv_heads = model_config.num_key_value_heads // hardware_config.tp_size
         head_dim = model_config.hidden_size // model_config.num_attention_heads
@@ -623,6 +643,7 @@ class ExecutionContext:
                    policy=policy,
                    token_to_kv_pool=token_to_kv_pool,
                    experts_cache=experts_cache,
+                   experts_cache_cold=experts_cache_cold,
                    qkv_pin=qkv_pin,
                    hidden_pin=hidden_pin,
                    experts_pin=experts_pin,
@@ -648,7 +669,3 @@ class ExecutionContext:
     def delete_gpu_context(self):
         self.token_to_kv_pool.delete_gpu_cache()
         
-
-
-        
-    
