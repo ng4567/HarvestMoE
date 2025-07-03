@@ -670,8 +670,6 @@ class ExecutionContext:
 
         experts_cache_cold = torch.empty_like(experts_cache, device="cuda:1")
 
-        
-
         experts_pin = torch.empty(((num_comp_experts - num_experts_gpu),
                            3 * intermediate_size * model_config.hidden_size),
                            dtype=torch.get_default_dtype(), device="cuda:1")
