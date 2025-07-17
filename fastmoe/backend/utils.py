@@ -175,16 +175,16 @@ def log_gpu_memory_usage(expert_size_bytes: int):
         total_memory_bytes = torch.cuda.get_device_properties(i).total_memory
         total_memory_gb = total_memory_bytes / (1024 ** 3)
         
-        # Get free memory in bytes and convert to GB
-        free_memory_bytes = torch.cuda.mem_get_info(i)[0]
+        # Get free and total memory from system-wide perspective
+        free_memory_bytes, total_available_bytes = torch.cuda.mem_get_info(i)
         free_memory_gb = free_memory_bytes / (1024 ** 3)
         
-        # Get allocated memory in bytes and convert to GB
-        allocated_memory_bytes = torch.cuda.memory_allocated(i)
-        allocated_memory_gb = allocated_memory_bytes / (1024 ** 3)
+        # Calculate used memory (system-wide, not just current process)
+        used_memory_bytes = total_available_bytes - free_memory_bytes
+        used_memory_gb = used_memory_bytes / (1024 ** 3)
         
         output[f"GPU_{i}_total_mem_capacity"] = float(total_memory_gb)
-        output[f"GPU_{i}_mem_usage"] = float(allocated_memory_gb)
+        output[f"GPU_{i}_mem_usage"] = float(used_memory_gb)
         output[f"GPU_{i}_mem_free"] = float(free_memory_gb)
         output[f"GPU_{i}_experts_can_fit"] = int(free_memory_bytes // expert_size_bytes)
         
