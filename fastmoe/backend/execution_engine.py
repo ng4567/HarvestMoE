@@ -4,13 +4,15 @@ from dataclasses import dataclass
 from typing import List
 import time
 from collections import Counter, defaultdict
-
+import os
+import csv
+from datetime import datetime
 from fastmoe.utils.model_config import ModelConfig
 from fastmoe.backend.memory import TokenToKVPool
 from fastmoe.backend.optimizer import solve, Policy
 from fastmoe.backend.task import Batch, Req
 from fastmoe.backend.task_meta import ForwardMode, DecodePart
-from fastmoe.backend.utils import HardwareConfig
+from fastmoe.backend.utils import HardwareConfig, log_gpu_memory_usage
 from fastmoe.backend.model_runner import ModelRunner
 
 
@@ -55,6 +57,70 @@ class ExecutionEngine:
 
         # experts cache mapping: experts_id -> idx in self.context.experts_cache
         self.experts_mapping = [torch.empty(self.model_config.num_local_experts, dtype=torch.int64, device="cuda") for _ in range(self.model_config.num_hidden_layers)]
+    
+        # Calculate expert size in bytes for memory logging
+        intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
+        self.expert_size_bytes = 3 * intermediate_size * self.model_config.hidden_size * 4  # 4 bytes per float32
+        
+        # Initialize CSV logger for tracking GPU memory and expert activations
+        self.csv_logger = self._init_csv_logger()
+
+    def _log_moe_layer_data(self, batch_id: int, layer_id: int, experts_activated: List[int]):
+        """Log GPU memory usage and expert activations for a MoE layer to CSV."""
+        # Get current timestamp
+        timestamp = datetime.now().isoformat()
+        
+        # Get GPU memory usage
+        memory_data = log_gpu_memory_usage(self.expert_size_bytes)
+        
+        # Prepare CSV row
+        row = [timestamp, batch_id, layer_id, str(experts_activated)]
+        
+        # Add GPU memory data
+        num_gpus = torch.cuda.device_count()
+        for i in range(num_gpus):
+            row.extend([
+                memory_data[f"GPU_{i}_total_mem_capacity"],
+                memory_data[f"GPU_{i}_mem_usage"],
+                memory_data[f"GPU_{i}_mem_free"],
+                memory_data[f"GPU_{i}_experts_can_fit"]
+            ])
+        
+        # Write to CSV file
+        with open(self.csv_logger, 'a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(row)
+
+    def _init_csv_logger(self):
+            """Initialize CSV logger for tracking GPU memory usage and expert activations."""
+            # Create logs directory if it doesn't exist
+            os.makedirs("logs", exist_ok=True)
+            
+            # Create filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"logs/moe_layer_memory_log_{timestamp}.csv"
+            
+            # Get number of GPUs for column headers
+            num_gpus = torch.cuda.device_count()
+            
+            # Define CSV headers
+            headers = ["timestamp", "batch_id", "moe_layer_id", "experts_activated"]
+            
+            # Add GPU memory columns for each GPU
+            for i in range(num_gpus):
+                headers.extend([
+                    f"GPU_{i}_total_mem_capacity",
+                    f"GPU_{i}_mem_usage", 
+                    f"GPU_{i}_mem_free",
+                    f"GPU_{i}_experts_can_fit"
+                ])
+            
+            # Create CSV file and write headers
+            with open(filename, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(headers)
+            
+            return filename
     
     def init_weights_prefetch_meta(self):
 
@@ -114,7 +180,6 @@ class ExecutionEngine:
                 return slice(gpu_start_pos, gpu_start_pos + self.decode_slot_size)
 
 
-    
     def create_micro_batches(self, req_queue: List[Req]):     
         abort_requests: List[Req] = []
         micro_batches = []
@@ -298,7 +363,9 @@ class ExecutionEngine:
                 )
                 # record experts selected by gating (requires model_runner to expose `last_used_experts`)
                 if hasattr(self.model_runner, "last_used_experts"):
-                    self._record_expert_usage(batch_id, self.model_runner.last_used_experts)
+                    self._record_expert_usage(batch_id, layer_id, self.model_runner.last_used_experts)
+                    # Log GPU memory usage and expert activations to CSV
+                    self._log_moe_layer_data(batch_id, layer_id, self.model_runner.last_used_experts)
             else:
                 # last layer forward
                 logits, (logprobs, normalized_logprobs) = self.model_runner.prefill(
@@ -308,7 +375,9 @@ class ExecutionEngine:
                 )
                 # record experts selected by gating (requires model_runner to expose `last_used_experts`)
                 if hasattr(self.model_runner, "last_used_experts"):
-                    self._record_expert_usage(batch_id, self.model_runner.last_used_experts)
+                    self._record_expert_usage(batch_id, layer_id, self.model_runner.last_used_experts)
+                    # Log GPU memory usage and expert activations to CSV
+                    self._log_moe_layer_data(batch_id, layer_id, self.model_runner.last_used_experts)
                 if logprobs is not None:
                     logprobs = logprobs.cpu().tolist()
                     normalized_logprobs = normalized_logprobs.cpu().tolist()
@@ -381,7 +450,9 @@ class ExecutionEngine:
                 batch, DecodePart.POSTATTN, layer_id, self.experts_mapping[layer_id]
             )
             if hasattr(self.model_runner, "last_used_experts"):
-                self._record_expert_usage(batch_id, self.model_runner.last_used_experts)
+                self._record_expert_usage(batch_id, layer_id, self.model_runner.last_used_experts)
+                # Log GPU memory usage and expert activations to CSV
+                self._log_moe_layer_data(batch_id, layer_id, self.model_runner.last_used_experts)
         else:
             # last layer forward
             logits, _ = self.model_runner.post_attn(batch, 
@@ -389,7 +460,9 @@ class ExecutionEngine:
                                                   layer_id, 
                                                   self.experts_mapping[layer_id])
             if hasattr(self.model_runner, "last_used_experts"):
-                self._record_expert_usage(batch_id, self.model_runner.last_used_experts)
+                self._record_expert_usage(batch_id, layer_id, self.model_runner.last_used_experts)
+                # Log GPU memory usage and expert activations to CSV
+                self._log_moe_layer_data(batch_id, layer_id, self.model_runner.last_used_experts)
             next_token_ids, next_token_probs = batch.sample(logits)
             next_token_ids = next_token_ids.cpu().tolist()
             print("Next token ids: ", next_token_ids)
@@ -478,12 +551,16 @@ class ExecutionEngine:
         event.wait(stream)
         self.wait_stats[label] += time.perf_counter() - start_t
 
-    def _record_expert_usage(self, batch_id: int, expert_ids):
+    def _record_expert_usage(self, batch_id: int, layer_id: int, expert_ids):
         """Update per‑micro‑batch expert activation counters."""
         if self.micro_batch_expert_counts is None:
             return
         if isinstance(expert_ids, torch.Tensor):
             expert_ids = expert_ids.tolist()
+        
+        # Add print statements to show layer and expert activations
+        print(f"MoE Layer {layer_id}, Micro-batch {batch_id}: Activated experts {expert_ids}")
+        
         self.micro_batch_expert_counts[batch_id].update(expert_ids)
 
     def get_metrics(self):

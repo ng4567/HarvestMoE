@@ -110,6 +110,13 @@ class ModelRunner:
 
         logger.info(f"Rank {self.tp_rank}: load weight end.")
     
+    @property
+    def last_used_experts(self):
+        """Expose the last activated experts from the MoE layer."""
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'block_sparse_moe'):
+            return getattr(self.model.model.block_sparse_moe, 'last_activated_experts', None)
+        return None
+    
     @torch.inference_mode()
     def forward_prefill(
         self,

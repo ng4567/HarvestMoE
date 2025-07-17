@@ -1,6 +1,12 @@
 import dataclasses
 from fastmoe.utils.model_config import ModelConfig
 import numpy as np
+from collections import defaultdict
+import torch
+import os
+import csv
+import datetime
+from typing import List 
 
 KB = 1 << 10
 MB = 1 << 20
@@ -160,3 +166,83 @@ def MLP_bytes(hidden_size1, hidden_size2, batch_size, n_experts):
     weight_bytes = 2 * hidden_size1 * hidden_size2 * 3 * n_experts  # Weight data bytes
     return input_bytes + output_bytes + weight_bytes
 
+def log_gpu_memory_usage(expert_size_bytes: int):
+    num_gpus = torch.cuda.device_count()
+    output = defaultdict(str)
+
+    for i in range(num_gpus):
+        # Get total memory in bytes and convert to GB
+        total_memory_bytes = torch.cuda.get_device_properties(i).total_memory
+        total_memory_gb = total_memory_bytes / (1024 ** 3)
+        
+        # Get free memory in bytes and convert to GB
+        free_memory_bytes = torch.cuda.mem_get_info(i)[0]
+        free_memory_gb = free_memory_bytes / (1024 ** 3)
+        
+        # Get allocated memory in bytes and convert to GB
+        allocated_memory_bytes = torch.cuda.memory_allocated(i)
+        allocated_memory_gb = allocated_memory_bytes / (1024 ** 3)
+        
+        output[f"GPU_{i}_total_mem_capacity"] = float(total_memory_gb)
+        output[f"GPU_{i}_mem_usage"] = float(allocated_memory_gb)
+        output[f"GPU_{i}_mem_free"] = float(free_memory_gb)
+        output[f"GPU_{i}_experts_can_fit"] = int(free_memory_bytes // expert_size_bytes)
+        
+    return output
+
+def _log_moe_layer_data(self, batch_id: int, layer_id: int, experts_activated: List[int]):
+        """Log GPU memory usage and expert activations for a MoE layer to CSV."""
+        # Get current timestamp
+        timestamp = datetime.now().isoformat()
+        
+        # Get GPU memory usage
+        memory_data = log_gpu_memory_usage(self.expert_size_bytes)
+        
+        # Prepare CSV row
+        row = [timestamp, batch_id, layer_id, str(experts_activated)]
+        
+        # Add GPU memory data
+        num_gpus = torch.cuda.device_count()
+        for i in range(num_gpus):
+            row.extend([
+                memory_data[f"GPU_{i}_total_mem_capacity"],
+                memory_data[f"GPU_{i}_mem_usage"],
+                memory_data[f"GPU_{i}_mem_free"],
+                memory_data[f"GPU_{i}_experts_can_fit"]
+            ])
+        
+        # Write to CSV file
+        with open(self.csv_logger, 'a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(row)
+
+def _init_csv_logger(self):
+        """Initialize CSV logger for tracking GPU memory usage and expert activations."""
+        # Create logs directory if it doesn't exist
+        os.makedirs("logs", exist_ok=True)
+        
+        # Create filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"logs/moe_layer_memory_log_{timestamp}.csv"
+        
+        # Get number of GPUs for column headers
+        num_gpus = torch.cuda.device_count()
+        
+        # Define CSV headers
+        headers = ["timestamp", "batch_id", "moe_layer_id", "experts_activated"]
+        
+        # Add GPU memory columns for each GPU
+        for i in range(num_gpus):
+            headers.extend([
+                f"GPU_{i}_total_mem_capacity",
+                f"GPU_{i}_mem_usage", 
+                f"GPU_{i}_mem_free",
+                f"GPU_{i}_experts_can_fit"
+            ])
+        
+        # Create CSV file and write headers
+        with open(filename, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(headers)
+        
+        return filename

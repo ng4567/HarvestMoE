@@ -98,6 +98,17 @@ class MixtralMoE(nn.Module):
     def forward(self, index:int, hidden_states: torch.Tensor, experts_cache: torch.Tensor) -> torch.Tensor:
         # router_logits: (n_token, n_experts)
         router_logits, _ = self.gates(index, hidden_states)
+        
+        # Extract which experts are activated (top_k per token)
+        # router_logits shape: [num_tokens, num_experts]
+        top_k_indices = torch.topk(router_logits, self.top_k, dim=-1)[1]  # [num_tokens, top_k]
+        
+        # Get unique expert IDs that were activated across all tokens
+        activated_experts = torch.unique(top_k_indices.flatten()).cpu().tolist()
+        
+        # Store activated experts for access by execution engine
+        self.last_activated_experts = activated_experts
+        
         final_hidden_states = stack_fused_moe(hidden_states,
                                         self.ws.gpu_cache,
                                         experts_cache,

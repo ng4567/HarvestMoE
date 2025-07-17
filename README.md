@@ -10,6 +10,18 @@ high resource utilization, and a performance model, *HRM*, based on a Hierarchic
 find policies with higher throughput than existing systems.
 
 
+Server side:
+```bash
+conda deactivate && conda activate fastmoe
+python -m fastmoe.serve.launch_server --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 --port 30000 --cpu-mem-bdw 76 --avg-prompt-len 77 --gen-len 32 --tp-size 2
+```
+
+Client side:
+```bash
+conda deactivate && conda activate fastmoe && cd /home/azureuser/multi-node/benchmarks/mtbench
+./benchmark.sh
+```
+
 ## Nikhil Pre-Install notes:
 
 Had to run the following manually before `pip install -e .` would work:
