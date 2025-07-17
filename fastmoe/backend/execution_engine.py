@@ -62,11 +62,20 @@ class ExecutionEngine:
         intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
         self.expert_size_bytes = 3 * intermediate_size * self.model_config.hidden_size * 4  # 4 bytes per float32
         
-        # Initialize CSV logger for tracking GPU memory and expert activations
-        self.csv_logger = self._init_csv_logger()
+        # Initialize CSV logger for tracking GPU memory and expert activations (only on rank 0)
+        from vllm.model_executor.parallel_utils.parallel_state import get_tensor_model_parallel_rank
+        self.tp_rank = get_tensor_model_parallel_rank()
+        if self.tp_rank == 0:
+            self.csv_logger = self._init_csv_logger()
+        else:
+            self.csv_logger = None
 
     def _log_moe_layer_data(self, batch_id: int, layer_id: int, experts_activated: List[int]):
         """Log GPU memory usage and expert activations for a MoE layer to CSV."""
+        # Only log from rank 0 to avoid duplicate files
+        if self.csv_logger is None:
+            return
+            
         # Get current timestamp
         timestamp = datetime.now().isoformat()
         
@@ -99,6 +108,7 @@ class ExecutionEngine:
             # Create filename with timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"logs/moe_layer_memory_log_{timestamp}.csv"
+            print(f"[Rank {self.tp_rank}] Initializing CSV logger: {filename}")
             
             # Get number of GPUs for column headers
             num_gpus = torch.cuda.device_count()
