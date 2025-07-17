@@ -219,7 +219,11 @@ class ModelRpcServer(rpyc.Service):
         
         for ub in self.exe_engine.micro_batches:
             self.handle_finished_requests(ub)
-    
+
+        metrics = self.exe_engine.get_metrics()
+        print(metrics)
+        
+
     def handle_batch_generate_request(
         self,
         recv_req: BatchTokenizedGenerateReqInput,

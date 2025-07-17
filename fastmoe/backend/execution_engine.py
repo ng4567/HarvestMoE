@@ -2,6 +2,8 @@ import torch
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List
+import time
+from collections import Counter, defaultdict
 
 from fastmoe.utils.model_config import ModelConfig
 from fastmoe.backend.memory import TokenToKVPool
@@ -19,6 +21,12 @@ class ExecutionEngine:
         self.hardware_config = hardware_config
         self.context = ExecutionContext.build_context(model_config, hardware_config, avg_prompt_len, gen_len)
         self.micro_batches: List[Batch] = None
+
+        # ---------------- instrumentation ----------------
+        # Accumulated blocking times per event label (seconds)
+        self.wait_stats = defaultdict(float)
+        # Populated in create_micro_batches(); one Counter per micro‑batch
+        self.micro_batch_expert_counts = None
 
         # sync primititves
         # record in prefetch experts from pin, wait in prefetch experts to pin & post attn
@@ -164,7 +172,8 @@ class ExecutionEngine:
 
         self.attn_futures = [None for _ in range(len(micro_batches))]
         self.copy_futures = [None for _ in range(len(micro_batches))]
-            
+        # initialise per‑micro‑batch expert counters
+        self.micro_batch_expert_counts = [Counter() for _ in self.micro_batches]
         return len(micro_batches), abort_requests
     
     def prepare_for_prefill(self, int_token_logit_bias: torch.Tensor):
@@ -267,10 +276,15 @@ class ExecutionEngine:
         # wait on prefetch weights, load hidden and offload kv cache of the same cacheline
         batch = self.micro_batches[batch_id]
         if batch_id == 0:
-            self.prefetch_events[self.num_weights_slots_prefill - 1].wait(self.context.cur_stream)
-        self.context.offload_kv_events[batch.cache_line_idx].wait(self.context.cur_stream)
-        self.prefill_load_hidden_events[batch_id].wait(self.context.cur_stream)
-        
+            self._timed_wait(self.prefetch_events[self.num_weights_slots_prefill - 1],
+                             self.context.cur_stream,
+                             "prefetch_event_wait_prefill")
+        self._timed_wait(self.context.offload_kv_events[batch.cache_line_idx],
+                         self.context.cur_stream,
+                         "offload_kv_wait_prefill")
+        self._timed_wait(self.prefill_load_hidden_events[batch_id],
+                         self.context.cur_stream,
+                         "load_hidden_wait_prefill")
         #  computation
         if self.context.policy.eg != self.model_config.num_local_experts:
             # todo: add expert-level computation
@@ -282,6 +296,9 @@ class ExecutionEngine:
                     layer_id, self.experts_mapping[layer_id],
                     batch.return_logprob, self.attn_events[batch_id]
                 )
+                # record experts selected by gating (requires model_runner to expose `last_used_experts`)
+                if hasattr(self.model_runner, "last_used_experts"):
+                    self._record_expert_usage(batch_id, self.model_runner.last_used_experts)
             else:
                 # last layer forward
                 logits, (logprobs, normalized_logprobs) = self.model_runner.prefill(
@@ -289,6 +306,9 @@ class ExecutionEngine:
                     self.experts_mapping[layer_id],
                     batch.return_logprob, self.attn_events[batch_id]
                 )
+                # record experts selected by gating (requires model_runner to expose `last_used_experts`)
+                if hasattr(self.model_runner, "last_used_experts"):
+                    self._record_expert_usage(batch_id, self.model_runner.last_used_experts)
                 if logprobs is not None:
                     logprobs = logprobs.cpu().tolist()
                     normalized_logprobs = normalized_logprobs.cpu().tolist()
@@ -350,18 +370,26 @@ class ExecutionEngine:
     def post_attention(self, layer_id: int, page_id: int, batch_id: int):
         batch = self.micro_batches[batch_id]
         if batch_id == 0:
-            self.prefetch_events[self.num_weights_slots_decode - 1].wait(self.context.cur_stream)
-        self.load_hidden_events[batch_id].wait(self.context.cur_stream)
+            self._timed_wait(self.prefetch_events[self.num_weights_slots_decode - 1],
+                             self.context.cur_stream,
+                             "prefetch_event_wait_decode")
+        self._timed_wait(self.load_hidden_events[batch_id],
+                         self.context.cur_stream,
+                         "load_hidden_wait_decode")
         if layer_id < self.model_config.num_hidden_layers - 1:
             batch.hidden_states, batch.residual = self.model_runner.post_attn(
                 batch, DecodePart.POSTATTN, layer_id, self.experts_mapping[layer_id]
             )
+            if hasattr(self.model_runner, "last_used_experts"):
+                self._record_expert_usage(batch_id, self.model_runner.last_used_experts)
         else:
             # last layer forward
             logits, _ = self.model_runner.post_attn(batch, 
                                                   DecodePart.POSTATTN, 
                                                   layer_id, 
                                                   self.experts_mapping[layer_id])
+            if hasattr(self.model_runner, "last_used_experts"):
+                self._record_expert_usage(batch_id, self.model_runner.last_used_experts)
             next_token_ids, next_token_probs = batch.sample(logits)
             next_token_ids = next_token_ids.cpu().tolist()
             print("Next token ids: ", next_token_ids)
@@ -442,6 +470,28 @@ class ExecutionEngine:
         self.num_weights_slots_decode = 0
 
         self.context.token_to_kv_pool.clear()
+
+    # ===== instrumentation helpers =====
+    def _timed_wait(self, event: torch.cuda.Event, stream: torch.cuda.Stream, label: str):
+        """Wait on a CUDA event and accumulate the host‑side blocking time."""
+        start_t = time.perf_counter()
+        event.wait(stream)
+        self.wait_stats[label] += time.perf_counter() - start_t
+
+    def _record_expert_usage(self, batch_id: int, expert_ids):
+        """Update per‑micro‑batch expert activation counters."""
+        if self.micro_batch_expert_counts is None:
+            return
+        if isinstance(expert_ids, torch.Tensor):
+            expert_ids = expert_ids.tolist()
+        self.micro_batch_expert_counts[batch_id].update(expert_ids)
+
+    def get_metrics(self):
+        """Return collected wait times and expert‑usage counters."""
+        return {
+            "wait_stats": dict(self.wait_stats),
+            "micro_batch_expert_counts": [dict(c) for c in (self.micro_batch_expert_counts or [])],
+        }
 
 
 @dataclass
