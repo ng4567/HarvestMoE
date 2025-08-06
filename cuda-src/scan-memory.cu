@@ -2,6 +2,11 @@
 #include <cuda_runtime.h>
 #include <iostream>
 
+struct Expert {
+    void *gpu_mem_address;
+    
+}
+
 
 // Gloabal functions run on GPU
 __global__ void hello_from_gpu() {
