@@ -35,34 +35,39 @@ struct Expert {
     }
 
     bool copy_expert_to_gpu(const at::Tensor& cpu_tensor) {
-        if (!allocated) {
-            std::cerr << "Expert must be allocated before copying." << std::endl;
+    if (!allocated) {
+        std::cerr << "Expert must be allocated before copying." << std::endl;
+        return false;
+    }
+
+    if (!cpu_tensor.device().is_cpu()) {
+        std::cerr << "Expected CPU tensor as source." << std::endl;
+        return false;
+    }
+
+    if (cpu_tensor.numel() != data.numel()) {
+        std::cerr << "Mismatch in number of elements. Cannot copy." << std::endl;
+        return false;
+    }
+
+    try {
+        cudaError_t err = cudaSetDevice(gpu_id);
+        if (err != cudaSuccess) {
+            std::cerr << "cudaSetDevice failed: " << cudaGetErrorString(err) << std::endl;
             return false;
         }
 
-        if (!cpu_tensor.device().is_cpu()) {
-            std::cerr << "Expected CPU tensor as source." << std::endl;
-            return false;
-        }
-
-        if (cpu_tensor.numel() != data.numel()) {
-            std::cerr << "Mismatch in number of elements. Cannot copy." << std::endl;
-            return false;
-        }
-
-        try {
-            cudaSetDevice(gpu_id);
-            data.copy_(cpu_tensor);
-            return true;
-        } catch (const c10::Error& e) {
-            std::cerr << "Failed to copy to GPU: " << e.what() << std::endl;
-            return false;
+        data.copy_(cpu_tensor);  // ✅ Correct for libtorch C++
+        return true;
+    } catch (const c10::Error& e) {
+        std::cerr << "Failed to copy to GPU: " << e.what() << std::endl;
+        return false;
         }
     }
+
 };
 
-
-// Gloabal functions run on GPU
+// Global functions run on GPU
 __global__ void hello_from_gpu() {
     printf("Hello from thread %d (block %d)\n", threadIdx.x, blockIdx.x);
 }
