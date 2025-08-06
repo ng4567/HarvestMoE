@@ -6,22 +6,26 @@
 #include <torch/torch.h>
 
 struct Expert {
-    at::Tensor data;       // Tensor owning GPU memory
-    size_t expert_size;
-    int gpu_id;
-    bool allocated;
+    at::Tensor data;
+    size_t     expert_size;
+    int        gpu_id;
+    bool       allocated = false;
 
     Expert(size_t size_bytes, int device_id)
-        : expert_size(size_bytes), gpu_id(device_id), allocated(false) {}
+      : expert_size(size_bytes), gpu_id(device_id) {}
 
     bool allocate_expert() {
         cudaSetDevice(gpu_id);
         try {
-            data = at::empty({static_cast<long>(expert_size)}, 
-                             at::device(at::kCUDA, gpu_id).dtype(at::kByte));
+            data = at::empty(
+              { static_cast<int64_t>(expert_size) },
+              at::TensorOptions()
+                .device(at::kCUDA, gpu_id)
+                .dtype(at::kUInt8)
+            );
             allocated = true;
             return true;
-        } catch (const c10::Error& e) {
+        } catch (const c10::Error &e) {
             std::cerr << "Allocation failed: " << e.what() << std::endl;
             return false;
         }
@@ -29,42 +33,33 @@ struct Expert {
 
     void free_expert() {
         if (allocated) {
-            data.reset();  // Frees the tensor memory
+            data.reset();
             allocated = false;
         }
     }
 
-    bool copy_expert_to_gpu(const at::Tensor& cpu_tensor) {
-    if (!allocated) {
-        std::cerr << "Expert must be allocated before copying." << std::endl;
-        return false;
-    }
-
-    if (!cpu_tensor.device().is_cpu()) {
-        std::cerr << "Expected CPU tensor as source." << std::endl;
-        return false;
-    }
-
-    if (cpu_tensor.numel() != data.numel()) {
-        std::cerr << "Mismatch in number of elements. Cannot copy." << std::endl;
-        return false;
-    }
-
-    try {
-        cudaError_t err = cudaSetDevice(gpu_id);
-        if (err != cudaSuccess) {
-            std::cerr << "cudaSetDevice failed: " << cudaGetErrorString(err) << std::endl;
+    bool copy_expert_to_gpu(const at::Tensor &cpu_tensor) {
+        if (!allocated) {
+            std::cerr << "Expert must be allocated before copying.\n";
             return false;
         }
-
-        data.copy_(cpu_tensor);  // ✅ Correct for libtorch C++
-        return true;
-    } catch (const c10::Error& e) {
-        std::cerr << "Failed to copy to GPU: " << e.what() << std::endl;
-        return false;
+        if (!cpu_tensor.device().is_cpu()) {
+            std::cerr << "Source must be a CPU tensor.\n";
+            return false;
+        }
+        if (cpu_tensor.numel() != data.numel()) {
+            std::cerr << "Element count mismatch.\n";
+            return false;
+        }
+        try {
+            cudaSetDevice(gpu_id);
+            data.copy_(cpu_tensor, true);
+            return true;
+        } catch (const c10::Error &e) {
+            std::cerr << "Copy failed: " << e.what() << std::endl;
+            return false;
         }
     }
-
 };
 
 // Global functions run on GPU
