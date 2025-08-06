@@ -21,7 +21,7 @@ struct Expert {
               { static_cast<int64_t>(expert_size) },
               at::TensorOptions()
                 .device(at::kCUDA, gpu_id)
-                .dtype(at::kUInt8)
+                .dtype(at::kByte)
             );
             allocated = true;
             return true;
