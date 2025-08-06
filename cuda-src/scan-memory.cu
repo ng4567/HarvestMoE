@@ -52,7 +52,7 @@ struct Expert {
 
         try {
             cudaSetDevice(gpu_id);
-            data.copy_(cpu_tensor, /*non_blocking=*/true);
+            data.copy_(cpu_tensor);
             return true;
         } catch (const c10::Error& e) {
             std::cerr << "Failed to copy to GPU: " << e.what() << std::endl;
