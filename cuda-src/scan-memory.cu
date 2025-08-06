@@ -4,8 +4,7 @@
 
 struct Expert {
     void *gpu_mem_address;
-    
-}
+};
 
 
 // Gloabal functions run on GPU
