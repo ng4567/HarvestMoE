@@ -1,22 +1,22 @@
 # Makefile
 
-# The name of the final executable
 TARGET = scan-memory
-
-# The source file
 SRC = scan-memory.cu
-
-# The compiler
 NVCC = nvcc
-
-# Compiler flags - simplified without PyTorch for now
 NVCC_FLAGS = -arch=sm_89 -O2
 
-# Default target
+LIBTORCH_PATH ?= $(LIBTORCH_DIR)
+
+ifeq ($(LIBTORCH_PATH),)
+$(error Please set LIBTORCH_DIR to the path to your LibTorch installation)
+endif
+
+INCLUDES = -I$(LIBTORCH_PATH)/include -I$(LIBTORCH_PATH)/include/torch/csrc/api/include
+
 all: $(TARGET)
 
 $(TARGET): $(SRC)
-	$(NVCC) $(NVCC_FLAGS) -o $@ $<
+	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) -o $@ $<
 
 clean:
 	rm -f $(TARGET)
