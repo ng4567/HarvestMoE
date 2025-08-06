@@ -1,9 +1,64 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
 #include <iostream>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <torch/torch.h>
 
 struct Expert {
-    void *gpu_mem_address;
+    at::Tensor data;       // Tensor owning GPU memory
+    size_t expert_size;
+    int gpu_id;
+    bool allocated;
+
+    Expert(size_t size_bytes, int device_id)
+        : expert_size(size_bytes), gpu_id(device_id), allocated(false) {}
+
+    bool allocate_expert() {
+        cudaSetDevice(gpu_id);
+        try {
+            data = at::empty({static_cast<long>(expert_size)}, 
+                             at::device(at::kCUDA, gpu_id).dtype(at::kByte));
+            allocated = true;
+            return true;
+        } catch (const c10::Error& e) {
+            std::cerr << "Allocation failed: " << e.what() << std::endl;
+            return false;
+        }
+    }
+
+    void free_expert() {
+        if (allocated) {
+            data.reset();  // Frees the tensor memory
+            allocated = false;
+        }
+    }
+
+    bool copy_expert_to_gpu(const at::Tensor& cpu_tensor) {
+        if (!allocated) {
+            std::cerr << "Expert must be allocated before copying." << std::endl;
+            return false;
+        }
+
+        if (!cpu_tensor.device().is_cpu()) {
+            std::cerr << "Expected CPU tensor as source." << std::endl;
+            return false;
+        }
+
+        if (cpu_tensor.numel() != data.numel()) {
+            std::cerr << "Mismatch in number of elements. Cannot copy." << std::endl;
+            return false;
+        }
+
+        try {
+            cudaSetDevice(gpu_id);
+            data.copy_(cpu_tensor, /*non_blocking=*/true);
+            return true;
+        } catch (const c10::Error& e) {
+            std::cerr << "Failed to copy to GPU: " << e.what() << std::endl;
+            return false;
+        }
+    }
 };
 
 
@@ -49,16 +104,30 @@ int get_num_gpus() {
 
 
 int main() {
-
     // Wait for GPU to finish before exiting
     cudaDeviceSynchronize();
 
+    // Allocate dummy CPU tensor (200MB of uint8_t)
     size_t expert_size = 200 * 1024 * 1024;
-    int num_gpus = get_num_gpus();
-    for (int i = 0; i < num_gpus; i++) {
-        get_num_experts_that_fit(expert_size, i);
+    at::Tensor dummy_cpu_tensor = at::zeros({static_cast<long>(expert_size)}, at::kByte);
+
+    // Create expert on GPU 0
+    Expert expert(expert_size, 0);
+
+    if (!expert.allocate_expert()) {
+        std::cerr << "Failed to allocate expert on GPU 0" << std::endl;
+        return 1;
     }
 
-    return 0;
+    if (!expert.copy_expert_to_gpu(dummy_cpu_tensor)) {
+        std::cerr << "Failed to copy expert to GPU 0" << std::endl;
+        expert.free_expert();
+        return 1;
+    }
 
+    std::cout << "Successfully copied dummy expert to GPU 0!" << std::endl;
+
+    // Free GPU memory
+    expert.free_expert();
+    return 0;
 }
