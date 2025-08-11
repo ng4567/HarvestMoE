@@ -6,7 +6,6 @@ num_gpus = torch.cuda.device_count()
 
 model_config_path = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 model_config = ModelConfig(model_config_path)
-assert os.path.exists(model_config_path), f"Model config file {model_config_path} does not exist"
 
 tp_size = model_config.tp_size
 dtype = torch.get_default_dtype()
