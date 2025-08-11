@@ -8,8 +8,9 @@ mc = ModelConfig("mistralai/Mixtral-8x7B-Instruct-v0.1")
 
 # If you add TP later, set this accordingly
 tp_size = 1
-# Match model param dtype (fp16)
-dtype = torch.get_default_dtype()
+
+
+dtype = torch.float16
 bytes_per_elem = torch.tensor([], dtype=dtype).element_size()
 
 # Per expert per layer (per TP rank)
