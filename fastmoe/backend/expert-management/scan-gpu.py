@@ -22,4 +22,4 @@ def get_num_experts_that_fit(gpu_id: int, full_expert=True, safety=0.8):
 
 if __name__ == "__main__":
     for gpu in range(num_gpus):
-        print(f"GPU {gpu} can fit {get_num_experts_that_fit(expert_size, gpu)} experts")
+        print(f"GPU {gpu} can fit {get_num_experts_that_fit(bytes_per_expert_per_layer, gpu)} experts")
