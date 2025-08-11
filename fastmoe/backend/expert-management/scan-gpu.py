@@ -7,10 +7,9 @@ num_gpus = torch.cuda.device_count()
 model_config_path = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 model_config = ModelConfig(model_config_path)
 
-tp_size = model_config.tp_size
 dtype = torch.get_default_dtype()
 
-elem_dim = 3 * (model_config.intermediate_size // tp_size) * model_config.hidden_size
+elem_dim = 3 * (model_config.intermediate_size) * model_config.hidden_size
 bytes_per_element = torch.tensor([], dtype=dtype).element_size()
 expert_size = elem_dim * bytes_per_element
 
