@@ -9,6 +9,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 import torch.distributed as dist
+from fastmoe.utils.port_utils import allocate_ports_with_retry, is_port_free
 
 def get_available_gpu_memory(gpu_id, distributed=True):
     """
@@ -86,25 +87,59 @@ def handle_port_init(
     additional_ports = (
         [additional_ports] if isinstance(additional_ports, int) else additional_ports
     )
-    # first check on server port
-    if not check_port(port):
-        new_port = alloc_usable_network_port(1, used_list=[port])[0]
-        print(f"Port {port} is not available, using {new_port} instead.")
-        port = new_port
+    
+    # Check and allocate main server port
+    if not is_port_free(port):
+        try:
+            # Try to find a free port starting from the requested port
+            for offset in range(100):
+                test_port = port + offset
+                if is_port_free(test_port):
+                    print(f"Port {port} is not available, using {test_port} instead.")
+                    port = test_port
+                    break
+            else:
+                raise RuntimeError(f"Could not find free port near {port}")
+        except Exception as e:
+            print(f"Error finding free port: {e}")
+            port = random.randint(30000, 40000)
 
-    # then we check on additional ports
-    additional_unique_ports = set(additional_ports) - {port}
-    # filter out ports that are already in use
-    can_use_ports = [port for port in additional_unique_ports if check_port(port)]
-
-    num_specified_ports = len(can_use_ports)
-    if num_specified_ports < 4 + tp_size:
-        addtional_can_use_ports = alloc_usable_network_port(
-            num=4 + tp_size - num_specified_ports, used_list=can_use_ports + [port]
-        )
-        can_use_ports.extend(addtional_can_use_ports)
-
-    additional_ports = can_use_ports[: 4 + tp_size]
+    # Allocate additional ports
+    num_required_ports = 4 + tp_size
+    
+    # Filter existing additional_ports for those that are actually free
+    valid_ports = [p for p in additional_ports if p != port and is_port_free(p)]
+    
+    if len(valid_ports) < num_required_ports:
+        # Need more ports - allocate them dynamically
+        num_needed = num_required_ports - len(valid_ports)
+        excluded_ports = [port] + valid_ports
+        
+        try:
+            new_ports = allocate_ports_with_retry(
+                num_ports=num_needed,
+                start_port=10000,
+                end_port=50000,
+                max_retries=3
+            )
+            # Ensure new ports don't overlap with excluded ones
+            new_ports = [p for p in new_ports if p not in excluded_ports]
+            valid_ports.extend(new_ports[:num_needed])
+        except Exception as e:
+            print(f"Warning: Could not allocate all required ports: {e}")
+            # Fallback to sequential allocation
+            for start in [10000, 20000, 30000, 40000]:
+                for p in range(start, start + 10000):
+                    if p not in excluded_ports and is_port_free(p):
+                        valid_ports.append(p)
+                        excluded_ports.append(p)
+                        if len(valid_ports) >= num_required_ports:
+                            break
+                if len(valid_ports) >= num_required_ports:
+                    break
+    
+    additional_ports = valid_ports[:num_required_ports]
+    print(f"Allocated ports - Main: {port}, Additional: {additional_ports}")
     return port, additional_ports
 
 

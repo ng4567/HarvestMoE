@@ -43,6 +43,7 @@ from fastmoe.serve.openai_protocol import (
     UsageInfo,
 )
 from fastmoe.serve.router.manager import start_router_process
+from fastmoe.serve.router.model_rpc import ModelRpcClient
 from fastmoe.serve.tokenizer_manager import TokenizerManager
 from fastmoe.serve.server_args import PortArgs, ServerArgs
 from fastmoe.utils.utils import handle_port_init
@@ -53,6 +54,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 app = FastAPI()
 tokenizer_manager = None
 chat_template_name = None
+model_client = None
 
 
 @app.get("/health")
@@ -81,9 +83,42 @@ async def generate_request(obj: GenerateReqInput):
     ret = await tokenizer_manager.generate_request(obj).__anext__()
     return ret
 
+
+@app.get("/expert_locations")
+async def get_expert_locations():
+    """Get current expert location tracking information."""
+    try:
+        if model_client is None:
+            raise HTTPException(status_code=503, detail="Model client not initialized")
+        # Get expert locations from the model client
+        locations = await model_client.get_expert_locations()
+        return locations
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/expert_locations/layer/{layer_id}")
+async def get_layer_expert_summary(layer_id: int):
+    """Get expert location summary for a specific layer."""
+    try:
+        if model_client is None:
+            raise HTTPException(status_code=503, detail="Model client not initialized")
+        # Get layer-specific expert summary
+        summary = await model_client.get_layer_expert_summary(layer_id)
+        if summary is None:
+            raise HTTPException(status_code=404, detail=f"Layer {layer_id} not found")
+        return summary
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 def launch_server(server_args, pipe_finish_writer):
     global tokenizer_manager
     global chat_template_name
+    global model_client
 
     # Handle ports
     server_args.port, server_args.additional_ports = handle_port_init(
@@ -167,6 +202,9 @@ def launch_server(server_args, pipe_finish_writer):
         sys.exit(1)
 
     assert proc_router.is_alive() and proc_detoken.is_alive()
+    
+    # Initialize model client for expert tracking API
+    model_client = ModelRpcClient(server_args, port_args)
 
     def launch_server():
         # Launch api server

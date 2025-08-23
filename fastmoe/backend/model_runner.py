@@ -1,5 +1,6 @@
 import importlib
 import logging
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
 
 import fastmoe
+from fastmoe.utils.port_utils import find_free_nccl_port
 
 logger = logging.getLogger("model_runner")
 
@@ -66,12 +68,29 @@ class ModelRunner:
 
         # Init torch distributed
         torch.cuda.set_device(self.tp_rank)
-        torch.distributed.init_process_group(
-            backend="nccl",
-            world_size=self.tp_size,
-            rank=self.tp_rank,
-            init_method=f"tcp://127.0.0.1:{self.nccl_port}",
-        )
+        
+        # Dynamically find a free port for NCCL
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                actual_nccl_port = find_free_nccl_port()
+                logger.info(f"Attempting to use NCCL port {actual_nccl_port} (attempt {attempt + 1}/{max_retries})")
+                
+                torch.distributed.init_process_group(
+                    backend="nccl",
+                    world_size=self.tp_size,
+                    rank=self.tp_rank,
+                    init_method=f"tcp://127.0.0.1:{actual_nccl_port}",
+                )
+                logger.info(f"Successfully initialized NCCL on port {actual_nccl_port}")
+                break
+            except RuntimeError as e:
+                if "Address already in use" in str(e) and attempt < max_retries - 1:
+                    logger.warning(f"Port {actual_nccl_port} already in use, retrying...")
+                    time.sleep(0.5)  # Wait before retry
+                    continue
+                else:
+                    raise
 
         # A small all_reduce for warmup.
         if self.tp_size > 1:

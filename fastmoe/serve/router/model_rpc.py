@@ -323,6 +323,24 @@ class ModelRpcServer(rpyc.Service):
                     output_finished,
                 )
             )
+    
+    def exposed_get_expert_locations(self):
+        """Get current expert location tracking information."""
+        if self.exe_engine is not None:
+            return self.exe_engine.get_expert_locations()
+        else:
+            return {
+                "error": "Execution engine not initialized",
+                "summary": {},
+                "all_experts": []
+            }
+    
+    def exposed_get_layer_expert_summary(self, layer_id: int):
+        """Get expert location summary for a specific layer."""
+        if self.exe_engine is not None:
+            return self.exe_engine.get_layer_expert_summary(layer_id)
+        else:
+            return {"error": "Execution engine not initialized"}
 
 
 class ModelRpcClient:
@@ -342,6 +360,8 @@ class ModelRpcClient:
                 return _func
 
             self.step = async_wrap(self.model_server.exposed_step)
+            self.get_expert_locations = async_wrap(self.model_server.exposed_get_expert_locations)
+            self.get_layer_expert_summary = async_wrap(self.model_server.exposed_get_layer_expert_summary)
         else:
             with ThreadPoolExecutor(tp_size) as executor:
                 # Launch model processes
@@ -367,6 +387,8 @@ class ModelRpcClient:
                 return _func
 
             self.step = async_wrap("step")
+            self.get_expert_locations = async_wrap("get_expert_locations")
+            self.get_layer_expert_summary = async_wrap("get_layer_expert_summary")
 
 
 def start_model_process(port):

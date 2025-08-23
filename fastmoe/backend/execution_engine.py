@@ -1,7 +1,7 @@
 import torch
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import List
+from typing import List, Dict, Any, Optional
 
 from fastmoe.utils.model_config import ModelConfig
 from fastmoe.backend.memory import TokenToKVPool
@@ -10,6 +10,7 @@ from fastmoe.backend.task import Batch, Req
 from fastmoe.backend.task_meta import ForwardMode, DecodePart
 from fastmoe.backend.utils import HardwareConfig
 from fastmoe.backend.model_runner import ModelRunner
+from fastmoe.backend.expert_tracker import ExpertTracker, MemoryLocation, ExpertStatus
 
 
 class ExecutionEngine:
@@ -52,6 +53,16 @@ class ExecutionEngine:
                         device="cuda:0")
             for _ in range(self.model_config.num_hidden_layers)
         ]
+        
+        # Initialize expert tracker
+        # Note: We'll update the actual GPU expert count in init_gpu_experts()
+        # For now, just initialize with basic structure
+        self.expert_tracker = ExpertTracker(
+            num_layers=self.model_config.num_hidden_layers,
+            num_experts_per_layer=self.model_config.num_local_experts,
+            num_gpu_experts=0,  # Will be updated later
+            cache_size=0  # Will be updated later
+        )
     
     def init_weights_prefetch_meta(self):
 
@@ -203,6 +214,9 @@ class ExecutionEngine:
                 self.context.experts_cache_cold[prefetch_cpu_slice],   # ← on cuda:1
                 non_blocking=True)
                 self.prefetch_events[slot_id].record(self.context.prefetch_stream)
+                
+                # Update expert tracking for prefetched experts
+                # TODO: Add tracking for which specific experts are being prefetched
 
         elif stage == 'decode':
             # wait on copy to pin
@@ -430,6 +444,34 @@ class ExecutionEngine:
         # link the experts cache to the model
         self.model_runner.model.link_gpu_experts_cache(self.context.experts_cache)
         num_gpu_experts = int(self.model_config.num_local_experts * self.context.policy.wg)
+        
+        # Update expert tracker with actual values
+        self.expert_tracker.gpu_capacity = num_gpu_experts
+        self.expert_tracker.cache_size = self.context.get_ecache_size()
+        
+        # Initialize all experts as being in CPU memory
+        for layer_id in range(self.model_config.num_hidden_layers):
+            for expert_id in range(self.model_config.num_local_experts):
+                if expert_id < num_gpu_experts:
+                    # GPU persistent experts
+                    self.expert_tracker.update_expert_location(
+                        layer_id=layer_id,
+                        expert_id=expert_id,
+                        location=MemoryLocation.GPU_PERSISTENT,
+                        status=ExpertStatus.CACHED,
+                        device_id=0,
+                        cache_slot=layer_id * num_gpu_experts + expert_id
+                    )
+                else:
+                    # CPU memory experts
+                    self.expert_tracker.update_expert_location(
+                        layer_id=layer_id,
+                        expert_id=expert_id,
+                        location=MemoryLocation.CPU_MEMORY,
+                        status=ExpertStatus.IDLE,
+                        device_id=-1,
+                        cache_slot=-1
+                    )
          
         if num_gpu_experts > 0:
             for i in range(self.model_config.num_hidden_layers):
@@ -471,6 +513,17 @@ class ExecutionEngine:
         self.num_weights_slots_decode = 0
 
         self.context.token_to_kv_pool.clear()
+    
+    def get_expert_locations(self) -> Dict[str, Any]:
+        """Get current expert location tracking information."""
+        return {
+            "summary": self.expert_tracker.get_global_summary(),
+            "all_experts": self.expert_tracker.get_all_expert_locations()
+        }
+    
+    def get_layer_expert_summary(self, layer_id: int) -> Optional[Dict[str, Any]]:
+        """Get expert location summary for a specific layer."""
+        return self.expert_tracker.get_layer_summary(layer_id)
 
 
 @dataclass
@@ -517,9 +570,9 @@ class ExecutionContext:
         
         policy, _ = solve(model_config, hardware_config, opt_args)
         print(f"Policy: {policy}")
-        # # hack
-        # policy.ubs = 8
-        # policy.n_ub = 39
+        # # hack - uncomment to force experts on GPU for testing
+        # policy.wg = 0.25  # 25% of experts on GPU = 2 experts per layer
+        # print(f"HACK: Overriding wg to {policy.wg} to force expert GPU caching")
         
         # allocate mem for the context
         ubs = policy.ubs

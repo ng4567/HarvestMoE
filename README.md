@@ -13,10 +13,47 @@ find policies with higher throughput than existing systems.
 #Curl API When Deployed:
 
 ```bash
-curl -s -X POST http://127.0.0.1:10000/generate \
+curl -s -X POST http://127.0.0.1:30000/generate \
   -H "Content-Type: application/json" \
-  -d '{"text":["Hello, world!"],"sampling_params":{"max_new_tokens":32},"batch":true,"stream":true}'
+  -d '{"text":["Hello, world!"],"sampling_params":{"max_new_tokens":32},"batch":true,"stream":false}'
 ```
+
+## Expert Location Tracking (New Feature)
+
+FastMoE now includes real-time expert location tracking to monitor where MoE experts are stored in memory.
+
+### Quick Start
+
+```bash
+# After starting the server, query expert locations:
+curl http://localhost:8000/expert_locations | python -m json.tool
+
+# Get info for a specific layer:
+curl http://localhost:8000/expert_locations/layer/0
+```
+
+### What It Shows
+
+- **Memory Distribution**: Where experts are located (GPU/CPU/Cache)
+- **Capacity Utilization**: How many experts can fit on GPU vs actual usage
+- **Layer Statistics**: Per-layer expert distribution
+
+Example output:
+```json
+{
+  "summary": {
+    "total_experts": 256,
+    "gpu_capacity": 0,      // Experts that can be permanently stored on GPU
+    "cache_capacity": 16,   // Dynamic buffer size
+    "global_location_distribution": {
+      "gpu_persistent": 0,  // Permanently on GPU
+      "cpu_memory": 256,    // In CPU memory
+      "gpu_cache": 0        // Temporarily on GPU
+    }
+  }
+}
+```
+
 
 ## Nikhil Pre-Install notes:
 
