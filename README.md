@@ -10,6 +10,14 @@ high resource utilization, and a performance model, *HRM*, based on a Hierarchic
 find policies with higher throughput than existing systems.
 
 
+#Curl API When Deployed:
+
+```bash
+curl -s -X POST http://127.0.0.1:10000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"text":["Hello, world!"],"sampling_params":{"max_new_tokens":32},"batch":true,"stream":true}'
+```
+
 ## Nikhil Pre-Install notes:
 
 Had to run the following manually before `pip install -e .` would work:

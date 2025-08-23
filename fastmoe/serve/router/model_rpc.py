@@ -64,7 +64,7 @@ class ModelRpcServer(rpyc.Service):
         )
         self.eos_token_id = self.tokenizer.eos_token_id
         self.int_token_logit_bias = torch.tensor(
-            get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
+            get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size), dtype=torch.float32
         )
         set_random_seed(server_args.random_seed)
         logger.info(

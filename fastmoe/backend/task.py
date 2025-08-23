@@ -178,7 +178,7 @@ class Batch:
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
         self.start_loc_gpu = torch.zeros((bs,), dtype=torch.int64, device="cuda")
         self.start_loc_gpu[1:] = torch.cumsum(self.seq_lens[:-1], dim=0)
-        self.positions = torch.cat([torch.arange(0, length, device='cuda') for length in seq_lens], dim=0)
+        self.positions = torch.cat([torch.arange(0, int(length), device='cuda') for length in seq_lens], dim=0)
 
         self.new_num_tokens = int(torch.sum(self.seq_lens))
         self.max_seq_len = int(torch.max(self.seq_lens))

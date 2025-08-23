@@ -7,6 +7,7 @@ import zmq.asyncio
 from fastmoe.serve.router.model_rpc import ModelRpcClient
 from fastmoe.serve.server_args import PortArgs, ServerArgs
 from fastmoe.utils.utils import get_exception_traceback
+from fastmoe.serve.io_struct import TokenizedGenerateReqInput, BatchTokenizedGenerateReqInput
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -29,7 +30,24 @@ class RouterManager:
 
     async def loop_for_forward(self):
         while True:
-            next_step_input = list(self.recv_reqs)
+            next_step_input = []
+            for req in self.recv_reqs:
+                # Convert single TokenizedGenerateReqInput to BatchTokenizedGenerateReqInput
+                if isinstance(req, TokenizedGenerateReqInput):
+                    batch_req = BatchTokenizedGenerateReqInput(
+                        rid=[req.rid],
+                        input_text=[req.input_text],
+                        input_ids=[req.input_ids],
+                        sampling_params=req.sampling_params,
+                        return_logprob=req.return_logprob,
+                        logprob_start_len=req.logprob_start_len,
+                        stream=req.stream
+                    )
+                    next_step_input.append(batch_req)
+                else:
+                    # Already a batch request
+                    next_step_input.append(req)
+            
             self.recv_reqs = []
             out_pyobjs = await self.model_client.step(next_step_input)
 
