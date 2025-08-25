@@ -446,7 +446,8 @@ class ExecutionEngine:
         num_gpu_experts = int(self.model_config.num_local_experts * self.context.policy.wg)
         
         # Update expert tracker with actual values
-        self.expert_tracker.gpu_capacity = num_gpu_experts
+        # GPU capacity is the total number of experts that can be on GPU across all layers
+        self.expert_tracker.gpu_capacity = num_gpu_experts * self.model_config.num_hidden_layers
         self.expert_tracker.cache_size = self.context.get_ecache_size()
         
         # Initialize all experts as being in CPU memory
@@ -571,8 +572,8 @@ class ExecutionContext:
         policy, _ = solve(model_config, hardware_config, opt_args)
         print(f"Policy: {policy}")
         # # hack - uncomment to force experts on GPU for testing
-        # policy.wg = 0.25  # 25% of experts on GPU = 2 experts per layer
-        # print(f"HACK: Overriding wg to {policy.wg} to force expert GPU caching")
+        policy.wg = 0.25  # 25% of experts on GPU = 2 experts per layer
+        print(f"HACK: Overriding wg to {policy.wg} to force expert GPU caching")
         
         # allocate mem for the context
         ubs = policy.ubs

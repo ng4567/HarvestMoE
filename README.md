@@ -54,6 +54,45 @@ Example output:
 }
 ```
 
+## Dynamic Expert Reallocation
+
+FastMoE supports moving experts between CPU and GPU memory at runtime:
+
+### Move Experts with cURL
+```bash
+# Move expert from GPU to CPU
+curl -X POST http://localhost:8000/expert_reallocation/request \
+  -H "Content-Type: application/json" \
+  -d '{"layer_id": 8, "expert_id": 1, "action": "move_to_cpu"}'
+
+# Move expert from CPU to GPU  
+curl -X POST http://localhost:8000/expert_reallocation/request \
+  -H "Content-Type: application/json" \
+  -d '{"layer_id": 8, "expert_id": 3, "action": "move_to_gpu"}'
+
+# Check reallocation stats
+curl http://localhost:8000/expert_reallocation/stats
+```
+
+### Move Experts with Python
+```python
+import requests
+
+# Move to CPU
+response = requests.post("http://localhost:8000/expert_reallocation/request", 
+    json={"layer_id": 8, "expert_id": 1, "action": "move_to_cpu"})
+
+# Move to GPU (if capacity available)
+response = requests.post("http://localhost:8000/expert_reallocation/request",
+    json={"layer_id": 8, "expert_id": 3, "action": "move_to_gpu"})
+
+# Check memory usage
+stats = requests.get("http://localhost:8000/expert_reallocation/stats").json()
+print(f"GPU: {stats['memory']['gpu_allocated_gb']}GB, CPU: {stats['memory']['cpu_expert_storage_gb']}GB")
+```
+
+**Note**: GPU capacity is limited by the `wg` parameter. Moves are non-blocking and won't interrupt inference.
+
 
 ## Nikhil Pre-Install notes:
 

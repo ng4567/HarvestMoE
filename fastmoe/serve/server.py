@@ -17,6 +17,8 @@ import uvicorn
 import uvloop
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel
+from typing import List, Dict, Any
 from fastmoe.serve.conversation import (
     Conversation,
     SeparatorStyle,
@@ -55,6 +57,30 @@ app = FastAPI()
 tokenizer_manager = None
 chat_template_name = None
 model_client = None
+
+
+# Expert Reallocation API Models
+class ExpertReallocationRequest(BaseModel):
+    """Request to reallocate a single expert."""
+    layer_id: int
+    expert_id: int
+    action: str  # "move_to_gpu", "move_to_cpu", "preload_cache", "evict_cache"
+    priority: int = 0
+    metadata: Dict[str, Any] = {}
+
+
+class BatchExpertReallocationRequest(BaseModel):
+    """Request to reallocate multiple experts."""
+    requests: List[ExpertReallocationRequest]
+    atomic: bool = True  # All succeed or all fail
+
+
+class ReallocationResponse(BaseModel):
+    """Response for reallocation requests."""
+    request_id: str
+    status: str
+    message: str = ""
+    details: Dict[str, Any] = {}
 
 
 @app.get("/health")
@@ -114,6 +140,97 @@ async def get_layer_expert_summary(layer_id: int):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/expert_reallocation/request")
+async def request_expert_reallocation(request: ExpertReallocationRequest) -> ReallocationResponse:
+    """Request reallocation of a single expert between memory locations."""
+    try:
+        if model_client is None:
+            raise HTTPException(status_code=503, detail="Model client not initialized")
+        
+        # Submit reallocation request to the model server
+        result = await model_client.request_expert_reallocation(
+            layer_id=request.layer_id,
+            expert_id=request.expert_id,
+            action=request.action,
+            priority=request.priority,
+            metadata=request.metadata
+        )
+        
+        return ReallocationResponse(
+            request_id=result.get("request_id", ""),
+            status=result.get("status", "submitted"),
+            message=result.get("message", "Request submitted"),
+            details=result
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/expert_reallocation/batch")
+async def request_batch_expert_reallocation(batch: BatchExpertReallocationRequest) -> ReallocationResponse:
+    """Request reallocation of multiple experts."""
+    try:
+        if model_client is None:
+            raise HTTPException(status_code=503, detail="Model client not initialized")
+        
+        # Submit batch reallocation request
+        result = await model_client.request_batch_expert_reallocation(
+            requests=batch.requests,
+            atomic=batch.atomic
+        )
+        
+        return ReallocationResponse(
+            request_id=result.get("request_id", ""),
+            status=result.get("status", "submitted"),
+            message=result.get("message", f"Batch request with {len(batch.requests)} experts submitted"),
+            details=result
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/expert_reallocation/status/{request_id}")
+async def get_reallocation_status(request_id: str) -> ReallocationResponse:
+    """Get the status of a reallocation request."""
+    try:
+        if model_client is None:
+            raise HTTPException(status_code=503, detail="Model client not initialized")
+        
+        status = await model_client.get_reallocation_status(request_id)
+        
+        if status is None:
+            raise HTTPException(status_code=404, detail=f"Request {request_id} not found")
+        
+        return ReallocationResponse(
+            request_id=request_id,
+            status=status.get("status", "unknown"),
+            message=status.get("message", ""),
+            details=status
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/expert_reallocation/stats")
+async def get_reallocation_stats():
+    """Get statistics about expert reallocation."""
+    try:
+        if model_client is None:
+            raise HTTPException(status_code=503, detail="Model client not initialized")
+        
+        stats = await model_client.get_reallocation_stats()
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 def launch_server(server_args, pipe_finish_writer):
     global tokenizer_manager

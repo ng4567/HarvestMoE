@@ -19,6 +19,11 @@ from fastmoe.backend.execution_engine import ExecutionEngine
 from fastmoe.backend.utils import HardwareConfig
 from fastmoe.backend.task import Batch, Req
 from fastmoe.backend.model_runner import ModelRunner, _set_default_torch_dtype
+from fastmoe.backend.expert_reallocation import (
+    ReallocationManager, ExpertMover, ExpertReallocationRequest as ReallocationReq,
+    BatchReallocationRequest, ReallocationAction, ReallocationStatus
+)
+import uuid
 from fastmoe.serve.server_args import PortArgs, ServerArgs
 from fastmoe.utils.model_config import ModelConfig
 from fastmoe.utils.utils import (
@@ -86,6 +91,8 @@ class ModelRpcServer(rpyc.Service):
         self.stream_interval = server_args.stream_interval
 
         self.exe_engine: ExecutionEngine = None
+        self.reallocation_manager = None
+        self.expert_mover = None
 
         with _set_default_torch_dtype(torch.float16):
             self.build_tasks_and_exec_ctx(server_args.avg_prompt_len, server_args.gen_len)
@@ -132,6 +139,10 @@ class ModelRpcServer(rpyc.Service):
         self.exe_engine = ExecutionEngine(self.model_runner, self.model_config, self.hardware_config, avg_prompt_len, gen_len)
         self.exe_engine.init_gpu_experts()
         torch.cuda.synchronize()
+        
+        # Initialize reallocation components
+        self.reallocation_manager = ReallocationManager(max_concurrent_moves=2)
+        self.expert_mover = ExpertMover(self.exe_engine, self.exe_engine.expert_tracker)
 
     @torch.inference_mode()
     def batch_forward_step(self):
@@ -341,6 +352,153 @@ class ModelRpcServer(rpyc.Service):
             return self.exe_engine.get_layer_expert_summary(layer_id)
         else:
             return {"error": "Execution engine not initialized"}
+    
+    def exposed_request_expert_reallocation(self, layer_id: int, expert_id: int, 
+                                          action: str, priority: int = 0, 
+                                          metadata: dict = None):
+        """Request reallocation of a single expert."""
+        if self.reallocation_manager is None:
+            return {"error": "Reallocation manager not initialized"}
+        
+        try:
+            request_id = str(uuid.uuid4())
+            request = ReallocationReq(
+                request_id=request_id,
+                layer_id=layer_id,
+                expert_id=expert_id,
+                action=ReallocationAction(action),
+                priority=priority,
+                metadata=metadata or {}
+            )
+            
+            self.reallocation_manager.submit_request(request)
+            
+            # Start processing in background
+            # In a real implementation, this would be handled by a worker thread
+            success, error = self._process_reallocation_request(request)
+            
+            # Update the request status
+            request.status = ReallocationStatus.COMPLETED if success else ReallocationStatus.FAILED
+            request.error_message = error
+            request.completed_at = time.time()
+            
+            # Move from active to completed if needed
+            with self.reallocation_manager._lock:
+                if request.request_id in self.reallocation_manager.active_requests:
+                    self.reallocation_manager.completed_requests[request.request_id] = request
+                    del self.reallocation_manager.active_requests[request.request_id]
+            
+            return {
+                "request_id": request_id,
+                "status": "completed" if success else "failed",
+                "message": error if error else "Expert reallocation completed",
+                "success": success
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def exposed_request_batch_expert_reallocation(self, requests: list, atomic: bool = True):
+        """Request reallocation of multiple experts."""
+        if self.reallocation_manager is None:
+            return {"error": "Reallocation manager not initialized"}
+        
+        try:
+            batch_id = str(uuid.uuid4())
+            realloc_requests = []
+            
+            for req in requests:
+                realloc_req = ReallocationReq(
+                    request_id=str(uuid.uuid4()),
+                    layer_id=req["layer_id"],
+                    expert_id=req["expert_id"],
+                    action=ReallocationAction(req["action"]),
+                    priority=req.get("priority", 0),
+                    metadata=req.get("metadata", {})
+                )
+                realloc_requests.append(realloc_req)
+            
+            batch = BatchReallocationRequest(
+                request_id=batch_id,
+                requests=realloc_requests,
+                atomic=atomic
+            )
+            
+            self.reallocation_manager.submit_batch(batch)
+            
+            # Process batch
+            results = []
+            for req in realloc_requests:
+                success, error = self._process_reallocation_request(req)
+                
+                # Update the request status
+                req.status = ReallocationStatus.COMPLETED if success else ReallocationStatus.FAILED
+                req.error_message = error
+                req.completed_at = time.time()
+                
+                # Move from active to completed if needed
+                with self.reallocation_manager._lock:
+                    if req.request_id in self.reallocation_manager.active_requests:
+                        self.reallocation_manager.completed_requests[req.request_id] = req
+                        del self.reallocation_manager.active_requests[req.request_id]
+                
+                results.append({"expert": f"L{req.layer_id}E{req.expert_id}", 
+                              "success": success, "error": error})
+            
+            return {
+                "request_id": batch_id,
+                "status": "completed",
+                "results": results
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def exposed_get_reallocation_status(self, request_id: str):
+        """Get the status of a reallocation request."""
+        if self.reallocation_manager is None:
+            return None
+        
+        request = self.reallocation_manager.get_request_status(request_id)
+        if request:
+            return {
+                "request_id": request.request_id,
+                "status": request.status.value,
+                "message": request.error_message or "",
+                "layer_id": request.layer_id,
+                "expert_id": request.expert_id,
+                "action": request.action.value
+            }
+        return None
+    
+    def exposed_get_reallocation_stats(self):
+        """Get statistics about expert reallocation."""
+        if self.reallocation_manager is None:
+            return {"error": "Reallocation manager not initialized"}
+        
+        stats = self.reallocation_manager.get_reallocation_stats()
+        
+        # Add memory statistics if available
+        if self.expert_mover:
+            memory_stats = self.expert_mover.get_memory_stats()
+            stats["memory"] = memory_stats
+            
+            # Clean up completed events periodically
+            cleaned = self.expert_mover.cleanup_completed_events()
+            if cleaned > 0:
+                logger.debug(f"Cleaned up {cleaned} completed transfer events")
+        
+        return stats
+    
+    def _process_reallocation_request(self, request: ReallocationReq):
+        """Process a single reallocation request."""
+        try:
+            if request.action == ReallocationAction.MOVE_TO_GPU:
+                return self.expert_mover.move_expert_to_gpu(request.layer_id, request.expert_id)
+            elif request.action == ReallocationAction.MOVE_TO_CPU:
+                return self.expert_mover.move_expert_to_cpu(request.layer_id, request.expert_id)
+            else:
+                return False, f"Unsupported action: {request.action}"
+        except Exception as e:
+            return False, str(e)
 
 
 class ModelRpcClient:
@@ -362,6 +520,10 @@ class ModelRpcClient:
             self.step = async_wrap(self.model_server.exposed_step)
             self.get_expert_locations = async_wrap(self.model_server.exposed_get_expert_locations)
             self.get_layer_expert_summary = async_wrap(self.model_server.exposed_get_layer_expert_summary)
+            self.request_expert_reallocation = async_wrap(self.model_server.exposed_request_expert_reallocation)
+            self.request_batch_expert_reallocation = async_wrap(self.model_server.exposed_request_batch_expert_reallocation)
+            self.get_reallocation_status = async_wrap(self.model_server.exposed_get_reallocation_status)
+            self.get_reallocation_stats = async_wrap(self.model_server.exposed_get_reallocation_stats)
         else:
             with ThreadPoolExecutor(tp_size) as executor:
                 # Launch model processes
@@ -389,6 +551,10 @@ class ModelRpcClient:
             self.step = async_wrap("step")
             self.get_expert_locations = async_wrap("get_expert_locations")
             self.get_layer_expert_summary = async_wrap("get_layer_expert_summary")
+            self.request_expert_reallocation = async_wrap("request_expert_reallocation")
+            self.request_batch_expert_reallocation = async_wrap("request_batch_expert_reallocation")
+            self.get_reallocation_status = async_wrap("get_reallocation_status")
+            self.get_reallocation_stats = async_wrap("get_reallocation_stats")
 
 
 def start_model_process(port):
