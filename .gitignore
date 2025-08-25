@@ -7,3 +7,10 @@ __pycache__/
 # Generated Jupyter Notebook files
 .ipynb_checkpoints/
 */*.png
+
+server.log
+server_gpu_experts.log
+server_new.log
+server_output.log
+
+.gitignore

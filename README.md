@@ -6,6 +6,25 @@ MoE Lightning was designed as a pipeline inference framework for Mixture of Expe
 
 Note that all testing was done using an Azure Standard_NC80adis_H100_v5 Instance with 2 H100 GPUs on Ubuntu 24.04.3 LTS. 
 
+## Technology Stack
+
+### Core ML Infrastructure
+- **PyTorch 2.1.2** - Deep learning framework providing tensor operations and GPU acceleration
+- **vLLM (0.2.7-0.4.1)** - High-performance LLM serving library for efficient inference and memory management
+- **Triton 2.2.0** - GPU kernel compiler enabling custom CUDA kernels for MoE routing and Flash Attention
+
+### Model & Tokenization
+- **HuggingFace Transformers** - Model loading, tokenization, and compatibility with Mixtral/DBRX architectures
+
+### API & Serving Layer
+- **FastAPI** - Modern async web framework for REST API endpoints (expert tracking, reallocation)
+- **Uvicorn + Uvloop** - High-performance ASGI server with optimized event loop for handling concurrent requests
+
+### System Optimization
+- **Intel MKL** - CPU-optimized math operations for fallback computations
+- **CUDA/NVLink** - GPU-to-GPU communication for fast expert weight transfers
+
+
 ## Pre-Installation:
 
 You will need nvidia drivers and g++

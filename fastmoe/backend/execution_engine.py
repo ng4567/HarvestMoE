@@ -2,7 +2,6 @@ import torch
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
-
 from fastmoe.utils.model_config import ModelConfig
 from fastmoe.backend.memory import TokenToKVPool
 from fastmoe.backend.optimizer import solve, Policy
