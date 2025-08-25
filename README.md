@@ -1,16 +1,46 @@
-# MoE-Lightning: Artifact Evaluation
+# Overview
 
-This document contains instruction for ASPLOS 2025 artifact evaluation for the paper *MoE-Lightning: High-Throughput MoE Inference on
-Memory-constrained GPUs*. 
+This repo is a research project by Nikhil Gopal & Kostis Kaffes. It is a fork of the [MoE Lightning repository](https://github.com/caoshiyi/artifacts/tree/asplos25).
 
-## Artifact Overview 
-In this artifact, we propose a high-throughput MoE batch infer-ence system, MoE-Lightning, that significantly outperforms
-SOTA baselines. MoE-Lightning introduces a novel CPU-GPU-I/O pipelining schedule, *CGOPipe*, with paged weights to achieve
-high resource utilization, and a performance model, *HRM*, based on a Hierarchical Roofline Model we introduce to help
-find policies with higher throughput than existing systems.
+MoE Lightning was designed as a pipeline inference framework for Mixture of Experts transformers. The goal was to hide the latency of model weight fetches from DRAM. Our additions builds upon the original by extending MoE Lightning to multi-GPU setups.
 
+[Nvidia NVLink](https://www.nvidia.com/en-us/data-center/nvlink/) provides an interface to transfer model weights between GPUs at much faster speeds compared to fetching from DRAM over PCIE. We added a feature inside the server API to keep track of Expert locations in memory, and to move them from DRAM to a GPU. On another thread, a program can continuously query this API as well as GPU memory usage to determine if more can be allocated into GPU memory. By allocating experts into open pockets of GPU memory on a cluster, we further reduce the impact of cache misses, and allow for the performance of the system to scale dynamically as memory usage evolves.
 
-#Curl API When Deployed:
+Note that all testing was done using an Azure Standard_NC80adis_H100_v5 Instance with 2 H100 GPUs on Ubuntu 24.04.3 LTS. 
+
+## Pre-Installation:
+
+You will need nvidia drivers and g++
+
+```bash
+sudo apt-get install g++
+sudo apt-get install -y software-properties-common
+sudo apt-get install -y nvidia-driver-535
+sudo apt-get install -y nvidia-cuda-toolkit
+```
+
+## Installation
+
+```bash
+git clone -b asplos-artifact https://github.com/ng4567/moe-lightning-fork.git
+cd FastMoE
+conda create -n fastmoe python=3.11
+conda activate fastmoe
+conda install -c https://software.repos.intel.com/python/conda/ -c conda-forge onemkl-sycl-blas
+conda install -c https://software.repos.intel.com/python/conda/ -c conda-forge mkl-include
+pip install -e .
+pip install triton==2.2.0
+```
+
+log into hugging face cli: `huggingface-cli login` (make sure to use a read token)
+
+## Launch Inference Server
+
+```bash
+python -m fastmoe.serve.launch_server --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 --port 30000 --cpu-mem-bdw 76 --avg-prompt-len 77 --gen-len 32
+```
+
+## Curl Inference Server:
 
 ```bash
 curl -s -X POST http://127.0.0.1:30000/generate \
@@ -18,11 +48,7 @@ curl -s -X POST http://127.0.0.1:30000/generate \
   -d '{"text":["Hello, world!"],"sampling_params":{"max_new_tokens":32},"batch":true,"stream":false}'
 ```
 
-## Expert Location Tracking (New Feature)
-
-FastMoE now includes real-time expert location tracking to monitor where MoE experts are stored in memory.
-
-### Quick Start
+## Query Expert Location
 
 ```bash
 # After starting the server, query expert locations:
@@ -54,9 +80,7 @@ Example output:
 }
 ```
 
-## Dynamic Expert Reallocation
-
-FastMoE supports moving experts between CPU and GPU memory at runtime:
+## Expert Movement
 
 ### Move Experts with cURL
 ```bash
@@ -93,95 +117,10 @@ print(f"GPU: {stats['memory']['gpu_allocated_gb']}GB, CPU: {stats['memory']['cpu
 
 **Note**: GPU capacity is limited by the `wg` parameter. Moves are non-blocking and won't interrupt inference.
 
-
-## Nikhil Pre-Install notes:
-
-Had to run the following manually before `pip install -e .` would work:
+## Run Test Bench
 
 ```bash
-conda install numpy
-sudo apt-get install g++
-```
-
-
-Add nvidia repo and install nvidia h100 drivers:
-
-```bash
-sudo apt-get install -y software-properties-common
-sudo apt-get install -y nvidia-driver-535
-```
-
-log into hugging face cli: `huggingface-cli login` (make sure to use a read token)
-
-
-after pip install -e:
-
-```bash
-sudo apt-get install -y nvidia-cuda-toolkit
-conda uninstall torch
-conda install torch-gpu
-pip uninstall torch
-pip install "vllm>=0.2.7,<0.4.1"
-conda install transformers
-```
-
-## Installation
-```
-git clone -b asplos-artifact https://github.com/caoshiyi/FastMoE.git 
-cd FastMoE
-conda create -n fastmoe python=3.11
-conda activate fastmoe
-conda install -c https://software.repos.intel.com/python/conda/ -c conda-forge onemkl-sycl-blas
-conda install -c https://software.repos.intel.com/python/conda/ -c conda-forge mkl-include
-pip install -e .
-pip install triton==2.2.0
-```
-
-
-## Run tests (MTBench)
-The first-time weights loading can take ~10min. Adjust `--gen-len` for different generation configurations.
-S2 (Recommend using GCP g2-standard-48 instance)
-```
-python -m fastmoe.serve.launch_server --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 --port 30000 --cpu-mem-bdw 76 --avg-prompt-len 77 --gen-len 32
 cd benchmarks/mtbench
 python bench.py --port 30000 --max-new-tokens 32 --ubs 324 --n-ub 14
 ```
-The corresponding `--ubs` and `--n-ub` can be obtained from the optimizer results after launching the serve:
-```
-CostModelConfig(s=77, n=32, l=32, h1=4096, h2=14336, nh=32, nkvh=8, n_experts=8, topk=2, gmem=25769803776, cmem=197880360960.0, ctog_bdw=17179869184, g_bdw=306016419840, c_bdw=81604378624.0, gpu_flops=104000000000000.0, cpu_flops=1600000000000.0, tp_size=1)
-status: 1
-weights size: 86.5000 GB
-non-experts weights size: 2.5000 GB
-ctog = 0.1549 s  gpu_T = 0.1549 s  cpu_T = 0.1549 s
-T = 4.957 s
-gpu peak mem (decode): 20.640 GB / 21.600 GB
-gpu_home: 10.43 GB
-gpu_w: 10.21 GB
-inter: 5.25 GB
-cpu peak mem (decode): 147.282 GB / 147.432 GB
-cpu_home_g: 142.32 GB
-cpu_w_g: 4.96 GB
-wg = 0.06  wc = 0.94  
-cg = 0.00  cc = 1.00  
-decode throughput = 944.66 token/s
-Policy: Policy(ubs=324, n_ub=14, wg=0.055884688, wc=0.94411531, cg=0.0, cc=1.0, eg=8)
-Free GPU memory: 13.1707763671875
-```
 
-For reference, on GCP g2-standard-48 instance (S2), we have
-```
---gen-len 32: --ubs 324 --n-ub 14
---gen-len 64: --ubs 228 --n-ub 16
---gen-len 128: --ubs 164 --n-ub 16
---gen-len 256: --ubs 132 --n-ub 12
-```
-
-On GCP T4 (48vCPU + 192 CPU Mem) instance (S1), we have:
-```
---gen-len 32: --ubs 164 --n-ub 19
---gen-len 64: --ubs 164 --n-ub 19
---gen-len 128: --ubs 164 --n-ub 14
---gen-len 256: --ubs 100 --n-ub 15
-```
-
-You may observe some variances on the generated policies. In that case, just use the generated policies to run the benchmarking.
