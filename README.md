@@ -24,6 +24,11 @@ Note that all testing was done using an Azure Standard_NC80adis_H100_v5 Instance
 - **Intel MKL** - CPU-optimized math operations for fallback computations
 - **CUDA/NVLink** - GPU-to-GPU communication for fast expert weight transfers
 
+## To-Do List:
+
+- implement KV Cache location tracking and movement to server API
+- add ability to move KV cache between DRAM/GPUs
+- benchmark SOTA models vs standard MoE Lightning
 
 ## Pre-Installation:
 
