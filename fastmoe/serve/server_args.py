@@ -26,6 +26,11 @@ class ServerArgs:
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     log_level: str = "info"
+    kv_cache_size_gb: float = 4.0  # Default KV cache size in GB
+    kv_block_size: int = 16  # Default vLLM paged attention block size
+    use_paged_kv_cache: bool = False  # Whether to use paged KV cache implementation
+    kv_cache_gpu_fraction: float = 1  # Fraction of KV cache to keep on GPU (rest on CPU)
+    kv_cache_override_capacity: Optional[int] = None  # Override computed capacity (tokens)
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -182,6 +187,35 @@ class ServerArgs:
             type=int,
             default=ServerArgs.log_stats_interval,
             help="Log stats interval in second.",
+        )
+        parser.add_argument(
+            "--kv-cache-size-gb",
+            type=float,
+            default=ServerArgs.kv_cache_size_gb,
+            help="KV cache size in GB.",
+        )
+        parser.add_argument(
+            "--kv-block-size",
+            type=int,
+            default=ServerArgs.kv_block_size,
+            help="vLLM paged attention block size.",
+        )
+        parser.add_argument(
+            "--use-paged-kv-cache",
+            action="store_true",
+            help="Use paged KV cache implementation instead of the default continuous buffer.",
+        )
+        parser.add_argument(
+            "--kv-cache-gpu-fraction",
+            type=float,
+            default=ServerArgs.kv_cache_gpu_fraction,
+            help="Fraction of KV cache to keep on GPU (rest on CPU). Default: 0.2 (20%% GPU, 80%% CPU).",
+        )
+        parser.add_argument(
+            "--kv-cache-override-capacity",
+            type=int,
+            default=ServerArgs.kv_cache_override_capacity,
+            help="Override the computed KV cache capacity (in tokens). If not specified, uses roofline model calculation.",
         )
 
     @classmethod

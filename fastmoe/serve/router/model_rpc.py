@@ -47,6 +47,7 @@ class ModelRpcServer(rpyc.Service):
         # Copy arguments
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
+        self.server_args = server_args  # Store server_args for later use
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -95,7 +96,10 @@ class ModelRpcServer(rpyc.Service):
         self.expert_mover = None
 
         with _set_default_torch_dtype(torch.float16):
-            self.build_tasks_and_exec_ctx(server_args.avg_prompt_len, server_args.gen_len)
+            # Use default values if not provided
+            avg_prompt_len = server_args.avg_prompt_len or 77
+            gen_len = server_args.gen_len or 32
+            self.build_tasks_and_exec_ctx(avg_prompt_len, gen_len)
 
     def flush_cache(self):
         if len(self.forward_queue) == 0 and (
@@ -136,7 +140,15 @@ class ModelRpcServer(rpyc.Service):
         return ret
     
     def build_tasks_and_exec_ctx(self, avg_prompt_len, gen_len):
-        self.exe_engine = ExecutionEngine(self.model_runner, self.model_config, self.hardware_config, avg_prompt_len, gen_len)
+        # Get KV cache configuration from server args
+        use_paged_kv_cache = hasattr(self.server_args, 'use_paged_kv_cache') and self.server_args.use_paged_kv_cache
+        kv_cache_config = {
+            'kv_cache_size_gb': getattr(self.server_args, 'kv_cache_size_gb', 4.0),
+            'kv_block_size': getattr(self.server_args, 'kv_block_size', 16),
+            'gpu_fraction': getattr(self.server_args, 'kv_cache_gpu_fraction', 0.2),
+            'override_capacity': getattr(self.server_args, 'kv_cache_override_capacity', None)
+        }
+        self.exe_engine = ExecutionEngine(self.model_runner, self.model_config, self.hardware_config, avg_prompt_len, gen_len, use_paged_kv_cache, kv_cache_config)
         self.exe_engine.init_gpu_experts()
         torch.cuda.synchronize()
         
@@ -488,6 +500,12 @@ class ModelRpcServer(rpyc.Service):
         
         return stats
     
+    def exposed_get_kv_cache_capacity(self):
+        """Get the computed KV cache capacity from the execution engine."""
+        if self.exe_engine is None:
+            return None
+        return self.exe_engine._calculate_paged_cache_capacity()
+    
     def _process_reallocation_request(self, request: ReallocationReq):
         """Process a single reallocation request."""
         try:
@@ -524,6 +542,7 @@ class ModelRpcClient:
             self.request_batch_expert_reallocation = async_wrap(self.model_server.exposed_request_batch_expert_reallocation)
             self.get_reallocation_status = async_wrap(self.model_server.exposed_get_reallocation_status)
             self.get_reallocation_stats = async_wrap(self.model_server.exposed_get_reallocation_stats)
+            self.get_kv_cache_capacity = async_wrap(self.model_server.exposed_get_kv_cache_capacity)
         else:
             with ThreadPoolExecutor(tp_size) as executor:
                 # Launch model processes
@@ -555,6 +574,7 @@ class ModelRpcClient:
             self.request_batch_expert_reallocation = async_wrap("request_batch_expert_reallocation")
             self.get_reallocation_status = async_wrap("get_reallocation_status")
             self.get_reallocation_stats = async_wrap("get_reallocation_stats")
+            self.get_kv_cache_capacity = async_wrap("get_kv_cache_capacity")
 
 
 def start_model_process(port):

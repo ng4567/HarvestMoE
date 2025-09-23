@@ -35,6 +35,10 @@ class HardwareConfig:
 
     @classmethod
     def init(cls, gpu_device_name, cpu_mem, c_bdw, tp_size):
+        # Default CPU bandwidth if not provided
+        if c_bdw is None:
+            c_bdw = 76  # Default CPU memory bandwidth in GB/s
+            
         if "H100" in gpu_device_name:
             return cls(
                 gmem=93 * GB,  # H100 NVL has ~93GB available memory (measured)

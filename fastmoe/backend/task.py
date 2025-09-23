@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List
+from typing import List, Any
 
 import numpy as np
 import torch
@@ -66,6 +66,7 @@ class Batch:
     reqs: List[Req]
    
     token_to_kv_pool: TokenToKVPool = None
+    paged_kv_cache: Any = None  # PagedKVCache, but using Any to avoid circular import
     cache_line_idx: int = None
     cpu_kv_pool_start_loc: int = None
     start_loc: torch.Tensor = None
@@ -125,7 +126,7 @@ class Batch:
         self.seq_lens_cpu = (self.seq_lens).to("cpu")
 
     
-    def prepare_for_prefill(self, token_to_kv_pool: TokenToKVPool, vocab_size: int, int_token_logit_bias: torch.Tensor, max_output_len: int):
+    def prepare_for_prefill(self, token_to_kv_pool: TokenToKVPool, paged_kv_cache, vocab_size: int, int_token_logit_bias: torch.Tensor, max_output_len: int):
         device = "cuda"
         bs = len(self.reqs)
         reqs = self.reqs
@@ -144,8 +145,24 @@ class Batch:
         print("new_num_tokens", new_num_tokens)
 
         bs = len(self.reqs)
-        self.cpu_kv_pool_start_loc, gpu_kv_pool_start_loc, self.cache_line_idx = token_to_kv_pool.alloc_cpu()
-        self.token_to_kv_pool = token_to_kv_pool
+        
+        # Handle KV cache allocation based on which system is being used
+        if token_to_kv_pool is not None:
+            # Original TokenToKVPool system
+            self.cpu_kv_pool_start_loc, gpu_kv_pool_start_loc, self.cache_line_idx = token_to_kv_pool.alloc_cpu()
+            self.token_to_kv_pool = token_to_kv_pool
+            self.paged_kv_cache = None
+        elif paged_kv_cache is not None:
+            # Paged KV cache system
+            self.paged_kv_cache = paged_kv_cache
+            self.token_to_kv_pool = None
+            # For paged cache, we'll allocate blocks per sequence
+            # Set dummy values for compatibility
+            self.cpu_kv_pool_start_loc = 0
+            gpu_kv_pool_start_loc = 0
+            self.cache_line_idx = 0
+        else:
+            raise ValueError("Either token_to_kv_pool or paged_kv_cache must be provided")
         
         # for kvcache offloading
         self.out_cache_loc = torch.zeros(new_num_tokens, device="cpu", dtype=torch.int64)
@@ -155,10 +172,18 @@ class Batch:
         out_cache_pt = 0
         for i in range(bs):
             seq_len = len(self.reqs[i].input_ids)
-            self.out_cache_loc[out_cache_pt : out_cache_pt + seq_len] = torch.arange(gpu_kv_pool_start_loc + pt, gpu_kv_pool_start_loc + pt + seq_len, device="cpu", dtype=torch.int64)
-            #  for cpu
-            start_loc[i] = self.cpu_kv_pool_start_loc + pt
-            self.decode_out_cache_loc[i] = self.cpu_kv_pool_start_loc + pt + seq_len - 1
+            if self.token_to_kv_pool is not None:
+                # Original system
+                self.out_cache_loc[out_cache_pt : out_cache_pt + seq_len] = torch.arange(gpu_kv_pool_start_loc + pt, gpu_kv_pool_start_loc + pt + seq_len, device="cpu", dtype=torch.int64)
+                #  for cpu
+                start_loc[i] = self.cpu_kv_pool_start_loc + pt
+                self.decode_out_cache_loc[i] = self.cpu_kv_pool_start_loc + pt + seq_len - 1
+            else:
+                # Paged KV cache - we'll handle this differently
+                # For now, use sequential indices - this will be remapped later
+                self.out_cache_loc[out_cache_pt : out_cache_pt + seq_len] = torch.arange(pt, pt + seq_len, device="cpu", dtype=torch.int64)
+                start_loc[i] = pt
+                self.decode_out_cache_loc[i] = pt + seq_len - 1
             pt += seq_len + max_output_len
             out_cache_pt += seq_len
         self.kv_pt = self.decode_out_cache_loc[-1] + 1
@@ -209,8 +234,13 @@ class Batch:
 
 
     def offload_kv_cache(self, layer_id: int):
-        store_size = self.kv_pt - self.cpu_kv_pool_start_loc
-        self.token_to_kv_pool.store(self.cpu_kv_pool_start_loc, store_size, layer_id)
+        if self.token_to_kv_pool is not None:
+            store_size = self.kv_pt - self.cpu_kv_pool_start_loc
+            self.token_to_kv_pool.store(self.cpu_kv_pool_start_loc, store_size, layer_id)
+        elif self.paged_kv_cache is not None:
+            # For paged KV cache, offloading is handled differently
+            # The blocks are already managed by the PagedKVCache
+            pass
         
     
     def sample(self, logits: torch.Tensor):

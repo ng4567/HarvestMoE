@@ -138,6 +138,7 @@ class ModelRunner:
         max_seq_len,
         out_cache_loc,
         token_to_kv_pool,
+        paged_kv_cache,
         return_logprob,
         hidden_states,
         residual,
@@ -155,6 +156,7 @@ class ModelRunner:
             max_seq_len=max_seq_len,
             out_cache_loc=out_cache_loc,
             token_to_kv_pool=token_to_kv_pool,
+            paged_kv_cache=paged_kv_cache,
             return_logprob=return_logprob,
             attn_event=attn_event,
             experts_mapping=experts_mapping,
@@ -200,6 +202,7 @@ class ModelRunner:
         self,
         cpu_token_start_index,
         token_to_kv_pool,
+        paged_kv_cache,
         seq_lens,
         start_loc,
         out_cache_loc,
@@ -217,7 +220,8 @@ class ModelRunner:
             out_cache_loc=out_cache_loc,
             qkv_pin=qkv_pin,
             hidden_pin=hidden_pin,
-            token_to_kv_pool=token_to_kv_pool
+            token_to_kv_pool=token_to_kv_pool,
+            paged_kv_cache=paged_kv_cache
         )
         return self.model.forward(None, None, input_metadata, None, None, cur_layers)
 
@@ -230,6 +234,7 @@ class ModelRunner:
             "max_seq_len": batch.max_seq_len,
             "out_cache_loc": batch.out_cache_loc,
             "token_to_kv_pool": batch.token_to_kv_pool,
+            "paged_kv_cache": batch.paged_kv_cache,
             "return_logprob": return_logprob,
             "hidden_states": batch.hidden_states,
             "residual": batch.residual,
@@ -255,6 +260,7 @@ class ModelRunner:
         kwargs = {}
         kwargs["cpu_token_start_index"] = batch.cpu_kv_pool_start_loc
         kwargs["token_to_kv_pool"] = batch.token_to_kv_pool
+        kwargs["paged_kv_cache"] = batch.paged_kv_cache
         kwargs["seq_lens"] = batch.seq_lens_cpu
         kwargs["start_loc"] = batch.start_loc
         kwargs["qkv_pin"] = input_pin

@@ -57,6 +57,8 @@ app = FastAPI()
 tokenizer_manager = None
 chat_template_name = None
 model_client = None
+server_args = None
+computed_kv_capacity = None  # Store computed capacity
 
 
 # Expert Reallocation API Models
@@ -81,6 +83,25 @@ class ReallocationResponse(BaseModel):
     status: str
     message: str = ""
     details: Dict[str, Any] = {}
+
+
+# KV Cache Configuration API Models
+class KVCacheConfigResponse(BaseModel):
+    """Response containing current KV cache configuration."""
+    kv_cache_size_gb: float
+    kv_block_size: int
+    kv_cache_size_bytes: int
+    use_paged_kv_cache: bool
+    computed_capacity: Optional[int] = None  # Computed capacity based on roofline model
+    override_capacity: Optional[int] = None  # User-specified override
+    message: str = ""
+
+
+class KVCacheConfigUpdateRequest(BaseModel):
+    """Request to update KV cache configuration."""
+    kv_cache_size_gb: Optional[float] = None
+    kv_block_size: Optional[int] = None
+    override_capacity: Optional[int] = None  # Override computed capacity
 
 
 @app.get("/health")
@@ -232,10 +253,120 @@ async def get_reallocation_stats():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def launch_server(server_args, pipe_finish_writer):
+@app.get("/kv_cache_config")
+async def get_kv_cache_config() -> KVCacheConfigResponse:
+    """Get current KV cache configuration.
+    
+    NOTE: These are stored configuration values. The actual KV cache size is 
+    determined by the optimizer policy based on batch size and sequence lengths.
+    Block size is not applicable as this implementation doesn't use paged attention.
+    """
+    try:
+        if server_args is None:
+            raise HTTPException(status_code=503, detail="Server not fully initialized")
+        
+        # Convert GB to bytes for additional information
+        kv_cache_size_bytes = int(server_args.kv_cache_size_gb * 1024 * 1024 * 1024)
+        
+        msg = "Current KV cache configuration"
+        if server_args.use_paged_kv_cache:
+            msg += " (Using paged KV cache implementation)"
+        else:
+            msg += " (Using default continuous buffer, values shown are configuration only)"
+        
+        # Get computed capacity from model client if available
+        computed_cap = None
+        if model_client is not None and hasattr(model_client, 'get_kv_cache_capacity'):
+            try:
+                computed_cap = await model_client.get_kv_cache_capacity()
+            except:
+                pass
+            
+        return KVCacheConfigResponse(
+            kv_cache_size_gb=server_args.kv_cache_size_gb,
+            kv_block_size=server_args.kv_block_size,
+            kv_cache_size_bytes=kv_cache_size_bytes,
+            use_paged_kv_cache=server_args.use_paged_kv_cache,
+            computed_capacity=computed_cap,
+            override_capacity=getattr(server_args, 'kv_cache_override_capacity', None),
+            message=msg
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/kv_cache_config/update")
+async def update_kv_cache_config(request: KVCacheConfigUpdateRequest) -> KVCacheConfigResponse:
+    """Update KV cache configuration dynamically.
+    
+    NOTE: These values are stored but not actively used by the model. The actual
+    KV cache is sized based on optimizer policy calculations. To truly change
+    KV cache behavior would require modifying the ExecutionContext initialization.
+    """
+    try:
+        if server_args is None:
+            raise HTTPException(status_code=503, detail="Server not fully initialized")
+        
+        # Update configuration if values are provided
+        if request.kv_cache_size_gb is not None:
+            if request.kv_cache_size_gb <= 0:
+                raise HTTPException(status_code=400, detail="KV cache size must be positive")
+            server_args.kv_cache_size_gb = request.kv_cache_size_gb
+        
+        if request.kv_block_size is not None:
+            if request.kv_block_size <= 0:
+                raise HTTPException(status_code=400, detail="KV block size must be positive")
+            # Block size should be a power of 2 for optimal performance
+            if request.kv_block_size & (request.kv_block_size - 1) != 0:
+                raise HTTPException(status_code=400, detail="KV block size should be a power of 2")
+            server_args.kv_block_size = request.kv_block_size
+        
+        if request.override_capacity is not None:
+            if request.override_capacity < 0:
+                raise HTTPException(status_code=400, detail="Override capacity must be non-negative")
+            server_args.kv_cache_override_capacity = request.override_capacity
+        
+        # Return updated configuration
+        kv_cache_size_bytes = int(server_args.kv_cache_size_gb * 1024 * 1024 * 1024)
+        
+        msg = "KV cache configuration updated"
+        if server_args.use_paged_kv_cache:
+            msg += " (Changes will apply to new sequences with paged KV cache)"
+        else:
+            msg += " (Note: Using default continuous buffer, changes stored but not actively used)"
+        
+        # Get computed capacity from model client if available
+        computed_cap = None
+        if model_client is not None and hasattr(model_client, 'get_kv_cache_capacity'):
+            try:
+                computed_cap = await model_client.get_kv_cache_capacity()
+            except:
+                pass
+        
+        return KVCacheConfigResponse(
+            kv_cache_size_gb=server_args.kv_cache_size_gb,
+            kv_block_size=server_args.kv_block_size,
+            kv_cache_size_bytes=kv_cache_size_bytes,
+            use_paged_kv_cache=server_args.use_paged_kv_cache,
+            computed_capacity=computed_cap,
+            override_capacity=getattr(server_args, 'kv_cache_override_capacity', None),
+            message=msg
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def launch_server(server_args_param, pipe_finish_writer):
     global tokenizer_manager
     global chat_template_name
     global model_client
+    global server_args
+    
+    server_args = server_args_param
 
     # Handle ports
     server_args.port, server_args.additional_ports = handle_port_init(

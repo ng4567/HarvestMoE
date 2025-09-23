@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Any
 import numpy as np
 import torch
 
@@ -30,6 +31,7 @@ class InputMetadata:
     
     # mem and index
     token_to_kv_pool: TokenToKVPool = None
+    paged_kv_cache: Any = None  # PagedKVCache, using Any to avoid circular import
     cpu_token_start_index: int = None
     out_cache_loc: torch.Tensor = None
     # attn input
@@ -58,6 +60,7 @@ class InputMetadata:
         total_num_tokens = None,
         out_cache_loc = None,
         token_to_kv_pool = None,
+        paged_kv_cache = None,
         return_logprob=False,
         attn_event=None,
         experts_mapping=None,
@@ -86,6 +89,7 @@ class InputMetadata:
                 total_num_tokens=total_num_tokens,
                 out_cache_loc=out_cache_loc,
                 token_to_kv_pool=token_to_kv_pool,
+                paged_kv_cache=paged_kv_cache,
                 return_logprob=return_logprob,
                 other_kv_index=other_kv_index,
                 attn_event=attn_event,
@@ -119,6 +123,7 @@ class InputMetadata:
         qkv_pin,
         hidden_pin,
         token_to_kv_pool,
+        paged_kv_cache=None,
     ):
 
         ret = cls(
@@ -127,6 +132,7 @@ class InputMetadata:
             start_loc=start_loc,
             seq_lens=seq_lens,
             token_to_kv_pool=token_to_kv_pool,
+            paged_kv_cache=paged_kv_cache,
             out_cache_loc=out_cache_loc,
             cpu_token_start_index=cpu_token_start_index,
             qkv_pin=qkv_pin,

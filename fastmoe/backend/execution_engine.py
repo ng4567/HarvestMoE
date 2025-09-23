@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from fastmoe.utils.model_config import ModelConfig
 from fastmoe.backend.memory import TokenToKVPool
+from fastmoe.backend.paged_kv_cache import PagedKVCache, calculate_cache_blocks
 from fastmoe.backend.optimizer import solve, Policy
 from fastmoe.backend.task import Batch, Req
 from fastmoe.backend.task_meta import ForwardMode, DecodePart
@@ -13,11 +14,14 @@ from fastmoe.backend.expert_tracker import ExpertTracker, MemoryLocation, Expert
 
 
 class ExecutionEngine:
-    def __init__(self, model_runner: ModelRunner, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int):
+    def __init__(self, model_runner: ModelRunner, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int, use_paged_kv_cache: bool = False, kv_cache_config: Optional[Dict[str, Any]] = None):
         self.model_runner = model_runner
         self.model_config = model_config
         self.hardware_config = hardware_config
-        self.context = ExecutionContext.build_context(model_config, hardware_config, avg_prompt_len, gen_len)
+        self.use_paged_kv_cache = use_paged_kv_cache
+        self.kv_cache_config = kv_cache_config or {}
+        self.kv_cache_override_capacity = kv_cache_config.get('override_capacity') if kv_cache_config else None
+        self.context = ExecutionContext.build_context(model_config, hardware_config, avg_prompt_len, gen_len, use_paged_kv_cache, kv_cache_config)
         self.micro_batches: List[Batch] = None
 
         # sync primititves
@@ -152,9 +156,16 @@ class ExecutionEngine:
 
                 # Find the partition with the smallest current sum
                 idx = partitions_sums.index(min(partitions_sums))
+                # Check capacity based on cache type
+                if self.context.token_to_kv_pool is not None:
+                    cache_capacity = self.context.token_to_kv_pool.cache_line
+                else:
+                    # For paged cache, calculate based on free blocks and roofline model
+                    cache_capacity = self._calculate_paged_cache_capacity()
+                
                 if ((partitions_sums[idx] + req.input_len) 
                     + (1 + len(partitions[idx])) * self.context.gen_len 
-                    > self.context.token_to_kv_pool.cache_line):
+                    > cache_capacity):
                     # if no partition can hold the req, abort the req
                     abort_requests.append(req)
                     continue
@@ -191,6 +202,7 @@ class ExecutionEngine:
     def prepare_for_prefill(self, int_token_logit_bias: torch.Tensor):
         for micro_batch in self.micro_batches:
             micro_batch.prepare_for_prefill(token_to_kv_pool=self.context.token_to_kv_pool,
+                                            paged_kv_cache=self.context.paged_kv_cache,
                                             vocab_size=self.model_config.vocab_size,
                                             int_token_logit_bias=int_token_logit_bias,
                                             max_output_len=self.context.gen_len,
@@ -496,6 +508,53 @@ class ExecutionEngine:
     def delete_gpu_context(self):
         self.context.delete_gpu_context()
     
+    def _calculate_paged_cache_capacity(self):
+        """Calculate capacity for paged KV cache based on free blocks and roofline model."""
+        # Check if user provided an override
+        if hasattr(self, 'kv_cache_override_capacity') and self.kv_cache_override_capacity is not None:
+            return self.kv_cache_override_capacity
+            
+        if self.context.paged_kv_cache is None:
+            return 2048  # Fallback
+        
+        # Get minimum free blocks across all layers (bottleneck)
+        gpu_free_blocks = float('inf')
+        cpu_free_blocks = float('inf')
+        
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            gpu_free = len(self.context.paged_kv_cache.gpu_block_tables[layer_idx].free_blocks)
+            cpu_free = len(self.context.paged_kv_cache.cpu_block_tables[layer_idx].free_blocks)
+            gpu_free_blocks = min(gpu_free_blocks, gpu_free)
+            cpu_free_blocks = min(cpu_free_blocks, cpu_free)
+        
+        block_size = self.context.paged_kv_cache.block_size
+        
+        # Calculate token capacity
+        # GPU uses 2x buffering (for prefill/decode overlap) like original system
+        gpu_token_capacity = (gpu_free_blocks * block_size) // 2
+        cpu_token_capacity = cpu_free_blocks * block_size
+        total_token_capacity = gpu_token_capacity + cpu_token_capacity
+        
+        # Calculate roofline model limit
+        # This is what the optimizer determined as optimal
+        roofline_limit = self.context.policy.n_ub * self.context.policy.ubs * \
+                        (self.context.avg_prompt_tokens + self.context.gen_len)
+        
+        # Use the smaller of the two
+        capacity = min(total_token_capacity, roofline_limit)
+        
+        # Log for debugging (only once)
+        if not hasattr(self, '_capacity_logged'):
+            print(f"Paged KV Cache Capacity Calculation:")
+            print(f"  GPU free blocks: {gpu_free_blocks}, CPU free blocks: {cpu_free_blocks}")
+            print(f"  Block size: {block_size}")
+            print(f"  Token capacity: {total_token_capacity} (GPU: {gpu_token_capacity}, CPU: {cpu_token_capacity})")
+            print(f"  Roofline limit: {roofline_limit}")
+            print(f"  Final capacity: {capacity}")
+            self._capacity_logged = True
+        
+        return capacity
+    
     def reset(self):
         self.micro_batches = None
         self.prefetch_events = None
@@ -512,7 +571,12 @@ class ExecutionEngine:
         self.num_weights_slots_prefill = 1
         self.num_weights_slots_decode = 0
 
-        self.context.token_to_kv_pool.clear()
+        if self.context.token_to_kv_pool is not None:
+            self.context.token_to_kv_pool.clear()
+        elif self.context.paged_kv_cache is not None:
+            # For paged KV cache, we need to free all allocated blocks
+            # TODO: Implement proper cleanup for paged KV cache
+            pass
     
     def get_expert_locations(self) -> Dict[str, Any]:
         """Get current expert location tracking information."""
@@ -530,8 +594,7 @@ class ExecutionEngine:
 class ExecutionContext:
     model_config: ModelConfig
     policy: Policy
-    token_to_kv_pool: TokenToKVPool
-
+    
     # experts cache on gpu
     experts_cache: torch.tensor
     experts_cache_cold: torch.tensor
@@ -555,8 +618,12 @@ class ExecutionContext:
     avg_prompt_tokens: int
     gen_len: int
     
+    # Optional fields must come last
+    token_to_kv_pool: Optional[TokenToKVPool] = None
+    paged_kv_cache: Optional[PagedKVCache] = None
+    
     @classmethod
-    def build_context(cls, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int):
+    def build_context(cls, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int, use_paged_kv_cache: bool = False, kv_cache_config: Optional[Dict[str, Any]] = None):
         avg_prompt_tokens = avg_prompt_len
         max_new_tokens = gen_len
 
@@ -577,17 +644,70 @@ class ExecutionContext:
         # allocate mem for the context
         ubs = policy.ubs
         bs = policy.n_ub * ubs
-        # kv cache pool size
-        gpu_token_buffer_size = int(2 * (ubs * (avg_prompt_tokens + max_new_tokens)))
-        cpu_token_pool_size = int(bs * (avg_prompt_tokens + max_new_tokens))
-        token_to_kv_pool = TokenToKVPool(
-            gpu_token_buffer_size,
-            cpu_token_pool_size,
-            dtype=torch.get_default_dtype(),
-            head_num = model_config.num_key_value_heads // hardware_config.tp_size,
-            head_dim = model_config.hidden_size // model_config.num_attention_heads,
-            layer_num = model_config.num_hidden_layers,
-        )
+        
+        # KV cache configuration
+        num_heads = model_config.num_key_value_heads // hardware_config.tp_size
+        head_dim = model_config.hidden_size // model_config.num_attention_heads
+        num_layers = model_config.num_hidden_layers
+        
+        if use_paged_kv_cache:
+            # Use paged KV cache with configurable parameters
+            kv_cache_config = kv_cache_config or {}
+            kv_cache_size_gb = kv_cache_config.get('kv_cache_size_gb', 4.0)
+            block_size = kv_cache_config.get('kv_block_size', 16)
+            
+            # Calculate number of blocks based on cache size
+            # Get split from config or use defaults
+            gpu_fraction = kv_cache_config.get('gpu_fraction', 0.2)  # Default 20% on GPU
+            cpu_fraction = 1.0 - gpu_fraction
+            
+            num_gpu_blocks = max(1, calculate_cache_blocks(
+                kv_cache_size_gb * gpu_fraction,
+                block_size, 
+                num_heads, 
+                head_dim,
+                torch.get_default_dtype()
+            ))
+            num_cpu_blocks = max(1, calculate_cache_blocks(
+                kv_cache_size_gb * cpu_fraction,
+                block_size,
+                num_heads,
+                head_dim,
+                torch.get_default_dtype()
+            ))
+            
+            print(f"Paged KV Cache Configuration:")
+            print(f"  Total cache size: {kv_cache_size_gb} GB")
+            print(f"  Block size: {block_size} tokens")
+            print(f"  GPU/CPU split: {gpu_fraction:.0%} / {cpu_fraction:.0%}")
+            print(f"  GPU blocks per layer: {num_gpu_blocks}")
+            print(f"  CPU blocks per layer: {num_cpu_blocks}")
+            print(f"  Total GPU memory: {num_gpu_blocks * block_size * 2 * num_heads * head_dim * 2 * num_layers / (1024**3):.2f} GB")
+            print(f"  Total CPU memory: {num_cpu_blocks * block_size * 2 * num_heads * head_dim * 2 * num_layers / (1024**3):.2f} GB")
+            
+            paged_kv_cache = PagedKVCache(
+                num_gpu_blocks=num_gpu_blocks,
+                num_cpu_blocks=num_cpu_blocks,
+                block_size=block_size,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                num_layers=num_layers,
+                dtype=torch.get_default_dtype()
+            )
+            token_to_kv_pool = None
+        else:
+            # Use original TokenToKVPool
+            gpu_token_buffer_size = int(2 * (ubs * (avg_prompt_tokens + max_new_tokens)))
+            cpu_token_pool_size = int(bs * (avg_prompt_tokens + max_new_tokens))
+            token_to_kv_pool = TokenToKVPool(
+                gpu_token_buffer_size,
+                cpu_token_pool_size,
+                dtype=torch.get_default_dtype(),
+                head_num=num_heads,
+                head_dim=head_dim,
+                layer_num=num_layers,
+            )
+            paged_kv_cache = None
 
         # experts cache
         # todo change optimizer to output the number of experts on gpu as a policy parameter
@@ -646,6 +766,7 @@ class ExecutionContext:
         return cls(model_config=model_config,
                    policy=policy,
                    token_to_kv_pool=token_to_kv_pool,
+                   paged_kv_cache=paged_kv_cache,
                    experts_cache=experts_cache,
                    experts_cache_cold=experts_cache_cold,
                    qkv_pin=qkv_pin,
@@ -671,5 +792,10 @@ class ExecutionContext:
         return self.experts_cache.shape[0]
     
     def delete_gpu_context(self):
-        self.token_to_kv_pool.delete_gpu_cache()
+        if self.token_to_kv_pool is not None:
+            self.token_to_kv_pool.delete_gpu_cache()
+        elif self.paged_kv_cache is not None:
+            # For paged KV cache, GPU memory is managed differently
+            # TODO: Implement GPU memory cleanup for paged cache if needed
+            pass
         
