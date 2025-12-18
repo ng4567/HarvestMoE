@@ -1,10 +1,25 @@
 """Fused MoE kernel."""
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from vllm._C import ops
-from vllm.utils import is_hip
+from vllm import _custom_ops as ops
+from vllm.platforms import current_platform
+
+# Compatibility: is_hip was removed, use current_platform.is_rocm() instead
+def is_hip() -> bool:
+    return current_platform.is_rocm()
+
+
+def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
+    """SiLU activation with gating: out = silu(x[..., :d]) * x[..., d:]
+    
+    This is a compatibility function for older vLLM versions.
+    Operates in-place on out tensor.
+    """
+    d = x.shape[-1] // 2
+    out.copy_(F.silu(x[..., :d]) * x[..., d:])
 
 
 @triton.jit
@@ -256,7 +271,7 @@ def stack_fused_moe(
     N = 2 * page_size // 3 // H
 
     
-    import vllm._moe_C as moe_kernels
+    from vllm import _custom_ops as moe_kernels
 
     topk_weights = torch.empty(M,
                                 topk,
@@ -275,10 +290,9 @@ def stack_fused_moe(
         topk_ids,
         token_expert_indicies,
         gating_output.float(),  # TODO(woosuk): Optimize this.
+        renormalize,
     )
     del token_expert_indicies  # Not used. Will be used in the future.
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     config = {
         'BLOCK_SIZE_M': 64,
@@ -316,7 +330,7 @@ def stack_fused_moe(
                             expert_ids, num_tokens_post_padded, False,
                             topk_ids.shape[1], config, N, H, 0)
 
-    ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+    silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
 
     invoke_fused_moe_kernel(intermediate_cache2, w1.view(w1.shape[0], -1, N//2), indicies, intermediate_cache3,
                             topk_weights, topk_ids, sorted_token_ids,

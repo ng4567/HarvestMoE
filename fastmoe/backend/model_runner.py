@@ -8,8 +8,22 @@ from fastmoe.backend.task import Batch
 from fastmoe.backend.task_meta import DecodePart, ForwardMode, InputMetadata
 from fastmoe.backend.memory import TokenToKVPool
 from fastmoe.utils.utils import get_available_gpu_memory, get_available_cpu_memory
-from vllm.model_executor.model_loader import _set_default_torch_dtype
-from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
+from vllm.distributed.parallel_state import (
+    initialize_model_parallel,
+    init_world_group,
+)
+import vllm.distributed.parallel_state as ps
+from contextlib import contextmanager
+
+@contextmanager
+def _set_default_torch_dtype(dtype: torch.dtype):
+    """Context manager to temporarily set default torch dtype."""
+    old_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(old_dtype)
 
 import fastmoe
 
@@ -76,6 +90,12 @@ class ModelRunner:
         # A small all_reduce for warmup.
         if self.tp_size > 1:
             torch.distributed.all_reduce(torch.zeros(1).cuda())
+        
+        # Initialize vllm's world group (required by new vllm API)
+        if ps._WORLD is None:
+            ranks = list(range(torch.distributed.get_world_size()))
+            ps._WORLD = init_world_group(ranks, self.tp_rank, "nccl")
+        
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         self.total_gpu_memory = get_available_gpu_memory(
             self.tp_rank, distributed=self.tp_size > 1

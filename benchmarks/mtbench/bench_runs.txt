@@ -1,0 +1,33 @@
+Run 1 - Wed Dec 17 21:33:42 UTC 2025
+Time: 244.512s
+Throughput: 586.311 tokens/s
+Run 2 - Wed Dec 17 21:37:53 UTC 2025
+Run 3 - Wed Dec 17 21:40:48 UTC 2025
+Run 4 - Wed Dec 17 21:40:48 UTC 2025
+Run 5 - Wed Dec 17 21:40:48 UTC 2025
+Run 1 - Thu Dec 18 18:24:28 UTC 2025
+Run 2 - Thu Dec 18 18:24:28 UTC 2025
+Run 3 - Thu Dec 18 18:24:29 UTC 2025
+Run 4 - Thu Dec 18 18:24:29 UTC 2025
+Run 5 - Thu Dec 18 18:24:29 UTC 2025
+Run 1 - Thu Dec 18 18:24:45 UTC 2025
+Time: 247.222s
+Throughput: 579.883 tokens/s
+Run 2 - Thu Dec 18 18:29:14 UTC 2025
+Time: 244.159s
+Throughput: 587.158 tokens/s
+Run 3 - Thu Dec 18 18:33:24 UTC 2025
+Time: 242.154s
+Throughput: 592.021 tokens/s
+Run 4 - Thu Dec 18 18:37:33 UTC 2025
+Time: 525.333s
+Throughput: 272.893 tokens/s
+Run 5 - Thu Dec 18 18:46:25 UTC 2025
+Time: 612.865s
+Throughput: 233.918 tokens/s
+Run 1 - Thu Dec 18 19:18:19 UTC 2025
+Time: 331.417s
+Throughput: 432.566 tokens/s
+Run 2 - Thu Dec 18 19:23:57 UTC 2025
+Time: 245.245s
+Throughput: 584.559 tokens/s

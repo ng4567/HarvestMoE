@@ -23,13 +23,12 @@ from fastmoe.models.configs.dbrx import DbrxConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, VocabParallelEmbedding, ParallelLMHead)
-from vllm.model_executor.parallel_utils.communication_op import (
+from vllm.distributed.communication_op import (
     tensor_model_parallel_all_reduce)
-from vllm.model_executor.parallel_utils.parallel_state import (
+from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.model_executor.weight_utils import (default_weight_loader,
-                                              hf_model_weights_iterator)
+from fastmoe.layers.compat import default_weight_loader, hf_model_weights_iterator
 
 
 
@@ -192,7 +191,7 @@ class DbrxAttention(nn.Module):
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.max_position,
-            base=int(self.rope_theta),
+            rope_parameters={"rope_type": "default", "rope_theta": float(self.rope_theta)},
             is_neox_style=True,
         )
 

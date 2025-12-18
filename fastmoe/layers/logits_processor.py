@@ -1,10 +1,8 @@
 import torch
 from fastmoe.backend.task_meta import ForwardMode
 from torch import nn
-from vllm.model_executor.parallel_utils.communication_op import (
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
-)
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
+from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 
 
 class LogitsProcessor(nn.Module):

@@ -3,3 +3,12 @@
 {"time": 708.4275691509247, "throughput": 202.9960524720388, "max_new_tokens": 32, "max_padding_length": 0}
 {"time": 785.8095536231995, "throughput": 294.5039277429926, "max_new_tokens": 64, "max_padding_length": 0}
 {"time": 2378.2434334754944, "throughput": 167.9222548788402, "max_new_tokens": 256, "max_padding_length": 0}
+{"time": 245.3322310447693, "throughput": 584.3504515875823, "max_new_tokens": 32, "max_padding_length": 0}
+{"time": 244.51190185546875, "throughput": 586.310927656766, "max_new_tokens": 32, "max_padding_length": 0}
+{"time": 247.2224555015564, "throughput": 579.8825988891509, "max_new_tokens": 32, "max_padding_length": 0}
+{"time": 244.1593532562256, "throughput": 587.1575185962884, "max_new_tokens": 32, "max_padding_length": 0}
+{"time": 242.1537628173828, "throughput": 592.020534110441, "max_new_tokens": 32, "max_padding_length": 0}
+{"time": 525.3332803249359, "throughput": 272.89342855135146, "max_new_tokens": 32, "max_padding_length": 0}
+{"time": 612.8646597862244, "throughput": 233.91787682782353, "max_new_tokens": 32, "max_padding_length": 0}
+{"time": 331.417405128479, "throughput": 432.5662979119166, "max_new_tokens": 32, "max_padding_length": 0}
+{"time": 245.2446539402008, "throughput": 584.5591237024729, "max_new_tokens": 32, "max_padding_length": 0}

@@ -4,7 +4,6 @@
 import torch
 import triton
 import triton.language as tl
-from fastmoe.utils.utils import wrap_kernel_launcher
 
 
 @triton.jit
@@ -145,10 +144,6 @@ def _fwd_kernel_stage2(
     tl.store(out_ptrs, acc)
 
 
-cached_kernel_stage1 = None
-cached_kernel_stage2 = None
-
-
 def _token_att_m_fwd(
     q,
     k_buffer,
@@ -176,28 +171,7 @@ def _token_att_m_fwd(
     else:
         num_warps = 2
 
-    global cached_kernel_stage1
-    if cached_kernel_stage1:
-        cached_kernel_stage1(
-            grid,
-            num_warps,
-            q,
-            k_buffer,
-            sm_scale,
-            Req_to_tokens,
-            B_req_idx,
-            B_Start_Loc,
-            B_Seqlen,
-            att_out,
-            Req_to_tokens.stride(0),
-            q.stride(0),
-            q.stride(1),
-            k_buffer.stride(0),
-            k_buffer.stride(1),
-            att_out.stride(0),
-        )
-        return
-
+    # Use standard Triton kernel call - Triton handles caching internally
     _fwd_kernel_stage1[grid](
         q,
         k_buffer,
@@ -219,7 +193,6 @@ def _token_att_m_fwd(
         num_warps=num_warps,
         num_stages=1,
     )
-    cached_kernel_stage1 = wrap_kernel_launcher(_fwd_kernel_stage1)
 
 
 def _token_softmax_reducev_fwd(
@@ -239,28 +212,7 @@ def _token_softmax_reducev_fwd(
 
     num_warps = 1
 
-    global cached_kernel_stage2
-    if cached_kernel_stage2:
-        cached_kernel_stage2(
-            grid,
-            num_warps,
-            logics,
-            v_buffer,
-            o,
-            req_to_tokens,
-            b_req_idx,
-            b_start_loc,
-            b_seq_len,
-            logics.stride(0),
-            v_buffer.stride(0),
-            v_buffer.stride(1),
-            o.stride(0),
-            o.stride(1),
-            req_to_tokens.stride(0),
-            other_kv_index,
-        )
-        return
-
+    # Use standard Triton kernel call - Triton handles caching internally
     _fwd_kernel_stage2[grid](
         logics,
         v_buffer,
@@ -282,7 +234,6 @@ def _token_softmax_reducev_fwd(
         num_warps=num_warps,
         num_stages=3,
     )
-    cached_kernel_stage2 = wrap_kernel_launcher(_fwd_kernel_stage2)
 
 
 def token_attention_fwd(

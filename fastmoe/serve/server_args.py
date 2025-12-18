@@ -20,6 +20,8 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_prefill_num_token: Optional[int] = None
     tp_size: int = 1
+    enable_expert_parallel: bool = False
+    all2all_backend: Optional[str] = None
     schedule_conservativeness: float = 1.0
     random_seed: int = 42
     stream_interval: int = 8
@@ -139,6 +141,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tp_size,
             help="Tensor parallelism degree.",
+        )
+        parser.add_argument(
+            "--enable-expert-parallel",
+            action="store_true",
+            help="Enable expert parallelism for MoE models.",
+        )
+        parser.add_argument(
+            "--all2all-backend",
+            type=str,
+            default=ServerArgs.all2all_backend,
+            choices=["allgather_reducescatter", "pplx", "deepep_low_latency", "deepep_high_throughput", None],
+            help="All2all backend for expert parallelism.",
         )
         parser.add_argument(
             "--model-mode",

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0, <70.0", "wheel", "torch==2.1.2", "py-cpuinfo"]
+requires = ["setuptools>=61.0", "wheel", "torch>=2.1.2", "py-cpuinfo", "mkl-include"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,15 +7,15 @@ name = "fastmoe"
 version = "0.0.1"
 description = "Fast MoE Serving." 
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "aiohttp", "fastapi", "psutil", "rpyc", "torch", "uvloop", "uvicorn",
-       "zmq", "vllm>=0.2.7, <0.4.1", "interegular", "lark", "numba",
+    "aiohttp", "fastapi", "psutil", "rpyc", "torch>=2.1.2", "uvloop", "uvicorn",
+       "pyzmq", "interegular", "lark", "numba",
        "pydantic", "referencing", "diskcache", "cloudpickle", "pillow","pulp",
-       "numpy==1.26.4",
+       "numpy>=1.26.4",
 ]
 
 [tool.setuptools.packages.find]
