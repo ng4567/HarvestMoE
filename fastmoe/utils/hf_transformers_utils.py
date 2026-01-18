@@ -68,13 +68,15 @@ NUM_KV_HEADS_KEYS = [
 ]
 
 INTERMEDIATE_SIZE_KEYS = [
+    "moe_intermediate_size",  # For Qwen MoE - check first
     "intermediate_size",
     "ffn_hidden_size",
 ]
 
 NUM_EXPERTS_KEYS = [
     "moe_num_experts",
-    "num_local_experts"
+    "num_local_experts",
+    "num_experts"
 ]
 
 TOPK_KEYS = [
@@ -86,10 +88,18 @@ TOPK_KEYS = [
 def get_context_length(config):
     """Get the context length of a model from a huggingface model config."""
     rope_scaling = getattr(config, "rope_scaling", None)
+    rope_scaling_factor = 1
+    
     if rope_scaling:
-        rope_scaling_factor = config.rope_scaling["factor"]
-    else:
-        rope_scaling_factor = 1
+        if "factor" in rope_scaling:
+            rope_scaling_factor = rope_scaling["factor"]
+        elif hasattr(config, "original_max_position_embeddings"):
+            # For models like Phi-3.5-MoE that use longrope scaling
+            # The factor is derived from max_position_embeddings / original_max_position_embeddings
+            max_pos = getattr(config, "max_position_embeddings", None)
+            orig_max_pos = config.original_max_position_embeddings
+            if max_pos and orig_max_pos:
+                rope_scaling_factor = max_pos / orig_max_pos
 
     for key in CONTEXT_LENGTH_KEYS:
         val = getattr(config, key, None)
@@ -127,6 +137,19 @@ def get_num_kv_heads(config):
         if val is not None:
             return val
     return None
+
+def get_head_dim(config):
+    """Get head_dim from config if explicitly set, otherwise calculate from hidden_size / num_attention_heads."""
+    # First check if head_dim is explicitly set (e.g., Phi-tiny-MoE)
+    head_dim = getattr(config, "head_dim", None)
+    if head_dim is not None:
+        return head_dim
+    # Fall back to calculating from hidden_size / num_attention_heads
+    hidden_size = get_hidden_size(config)
+    num_heads = get_num_attention_heads(config)
+    if hidden_size and num_heads:
+        return hidden_size // num_heads
+    return 0
 
 def get_intermediate_size(config):
     ffn_config = getattr(config, "ffn_config", None)

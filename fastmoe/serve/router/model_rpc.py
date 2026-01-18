@@ -55,6 +55,7 @@ class ModelRpcServer(rpyc.Service):
             port_args.nccl_port,
             server_args.load_format,
             server_args.trust_remote_code,
+            server_args.offload_device,
         )
         
         self.tokenizer = get_tokenizer(
@@ -86,6 +87,8 @@ class ModelRpcServer(rpyc.Service):
         self.stream_interval = server_args.stream_interval
 
         self.exe_engine: ExecutionEngine = None
+        self.offload_device = server_args.offload_device
+        self.wg_override = server_args.wg_override
 
         with _set_default_torch_dtype(torch.float16):
             self.build_tasks_and_exec_ctx(server_args.avg_prompt_len, server_args.gen_len)
@@ -129,7 +132,7 @@ class ModelRpcServer(rpyc.Service):
         return ret
     
     def build_tasks_and_exec_ctx(self, avg_prompt_len, gen_len):
-        self.exe_engine = ExecutionEngine(self.model_runner, self.model_config, self.hardware_config, avg_prompt_len, gen_len)
+        self.exe_engine = ExecutionEngine(self.model_runner, self.model_config, self.hardware_config, avg_prompt_len, gen_len, self.offload_device, self.wg_override)
         self.exe_engine.init_gpu_experts()
         torch.cuda.synchronize()
 
@@ -162,7 +165,7 @@ class ModelRpcServer(rpyc.Service):
         # update execution context for decode if necessary
         # decode
         decode_step = 0
-        num_decode_steps = self.exe_engine.context.gen_len - 1 if num_mb > 1 else 1
+        num_decode_steps = self.exe_engine.context.gen_len - 1
         while decode_step < num_decode_steps:
             print("decode step: ", decode_step)
             self.exe_engine.prepare_for_decode()

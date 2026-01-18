@@ -131,7 +131,11 @@ def get_int_token_logit_bias(tokenizer, vocab_size):
 
 
 def wrap_kernel_launcher(kernel):
-    """A faster launcher for triton kernels."""
+    """A faster launcher for triton kernels.
+    
+    Note: For Triton >= 3.0, the internal cache API changed.
+    We fall back to using the kernel directly in newer versions.
+    """
     import torch.distributed as dist
 
     if dist.is_initialized():
@@ -139,6 +143,12 @@ def wrap_kernel_launcher(kernel):
     else:
         rank = 0
 
+    # Check if using newer Triton API (>= 3.0) where cache is not available
+    if not hasattr(kernel, 'cache'):
+        # For newer Triton, just return the kernel's run method
+        # The kernel will be JIT-compiled on first use and cached internally
+        return kernel
+    
     kernels = kernel.cache[rank].values()
     kernel = next(iter(kernels))
 

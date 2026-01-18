@@ -1,0 +1,691 @@
+# coding=utf-8
+# Adapted from
+# https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
+"""Inference-only Qwen2MoE model compatible with fastmoe offloading."""
+from typing import List, Optional, Tuple
+import torch
+from torch import nn
+from transformers import Qwen2MoeConfig
+from tqdm import tqdm
+
+from fastmoe.backend.task_meta import InputMetadata, DecodePart
+from fastmoe.layers.attention import Attention
+from fastmoe.layers.stacked_fused_moe import stack_fused_moe
+from fastmoe.layers.linear import (LinearMethodBase,
+                                   QKVParallelLinear,
+                                   StackedLinear,
+                                   RowParallelLinear,
+                                   MergedColumnParallelLinear)
+from fastmoe.layers.logits_processor import LogitsProcessor
+
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding, ParallelLMHead)
+from vllm.distributed.communication_op import (
+    tensor_model_parallel_all_reduce)
+from vllm.distributed.parallel_state import (
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
+from vllm.model_executor.utils import set_weight_attrs
+from fastmoe.layers.compat import default_weight_loader, hf_model_weights_iterator
+
+
+class Qwen2MoeMLP(nn.Module):
+    """Shared expert MLP for Qwen2MoE."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        linear_method: Optional[LinearMethodBase] = None,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.intermediate_size_per_partition = intermediate_size // self.tp_size
+
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            linear_method=linear_method,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            linear_method=linear_method,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        gate, up = gate_up.chunk(2, dim=-1)
+        x = torch.nn.functional.silu(gate) * up
+        x, _ = self.down_proj(x)
+        return x
+
+
+class Qwen2MoE(nn.Module):
+    """A tensor-parallel MoE implementation for Qwen2MoE that shards each expert
+    across all ranks.
+
+    Each expert's weights are sharded across all ranks and a fused MoE
+    kernel is used for the forward pass, and finally we reduce the outputs
+    across ranks.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        shared_expert_intermediate_size: int,
+        params_dtype: Optional[torch.dtype] = None,
+        tp_size: Optional[int] = None,
+        renormalize: bool = False,
+        linear_method: Optional[LinearMethodBase] = None,
+        offload_device: str = "cpu",
+    ):
+        super().__init__()
+        self.tp_size = tp_size or get_tensor_model_parallel_world_size()
+        self.num_layers = num_layers
+        self.num_total_experts = num_experts
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size // self.tp_size
+        self.shared_expert_intermediate_size = shared_expert_intermediate_size
+        self.renormalize = renormalize
+        self.offload_device = offload_device
+
+        if params_dtype is None:
+            params_dtype = torch.get_default_dtype()
+            print(f"Using default dtype {params_dtype}")
+        self.params_dtype = params_dtype
+
+        # Gate for routing to experts
+        self.gates = StackedLinear(
+            self.num_layers,
+            self.hidden_size,
+            self.num_total_experts,
+            bias=False,
+            params_dtype=self.params_dtype,
+            linear_method=None
+        )
+
+        # Expert weights: [num_layers, num_experts, 3 * intermediate_size * hidden_size]
+        # Layout per expert: [W1 (gate), W3 (up), W2 (down)]
+        self.ws = nn.Parameter(
+            torch.empty(
+                self.num_layers,
+                self.num_total_experts,
+                3 * self.intermediate_size * self.hidden_size,
+                device=self.offload_device,
+                dtype=self.params_dtype
+            )
+        )
+
+        set_weight_attrs(self.ws, {
+            "weight_loader": self.weight_loader,
+        })
+
+        # Shared expert (one per layer, but we can stack them)
+        if shared_expert_intermediate_size > 0:
+            # Shared expert gate
+            self.shared_expert_gates = nn.Parameter(
+                torch.empty(
+                    self.num_layers,
+                    1,
+                    self.hidden_size,
+                    device="cuda",
+                    dtype=self.params_dtype
+                )
+            )
+            set_weight_attrs(self.shared_expert_gates, {
+                "weight_loader": self.shared_gate_weight_loader,
+            })
+
+            # Shared expert MLP weights (gate_up and down)
+            shared_intermediate_per_partition = shared_expert_intermediate_size // self.tp_size
+            # gate + up projections: hidden_size -> 2 * shared_intermediate
+            self.shared_gate_up = nn.Parameter(
+                torch.empty(
+                    self.num_layers,
+                    2 * shared_intermediate_per_partition,
+                    self.hidden_size,
+                    device="cuda",
+                    dtype=self.params_dtype
+                )
+            )
+            set_weight_attrs(self.shared_gate_up, {
+                "weight_loader": self.shared_gate_up_weight_loader,
+            })
+
+            # down projection: shared_intermediate -> hidden_size
+            self.shared_down = nn.Parameter(
+                torch.empty(
+                    self.num_layers,
+                    self.hidden_size,
+                    shared_intermediate_per_partition,
+                    device="cuda",
+                    dtype=self.params_dtype
+                )
+            )
+            set_weight_attrs(self.shared_down, {
+                "weight_loader": self.shared_down_weight_loader,
+            })
+        else:
+            self.shared_expert_gates = None
+            self.shared_gate_up = None
+            self.shared_down = None
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
+                      weight_name: str, expert_id: int, layer_id: int):
+        tp_rank = get_tensor_model_parallel_rank()
+        param_data = param.data
+        shard_size = self.intermediate_size
+        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        w3_offset = shard_size * self.hidden_size
+        w2_offset = 2 * shard_size * self.hidden_size
+
+        if weight_name.endswith("gate_proj.weight"):
+            param_data[layer_id, expert_id, 0:w3_offset] = loaded_weight[shard, :].reshape(-1)
+        elif weight_name.endswith("up_proj.weight"):
+            param_data[layer_id, expert_id, w3_offset:w2_offset] = loaded_weight[shard, :].reshape(-1)
+        elif weight_name.endswith("down_proj.weight"):
+            param_data[layer_id, expert_id, w2_offset:] = loaded_weight[:, shard].reshape(-1)
+
+    def shared_gate_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, layer_id: int):
+        param_data = param.data
+        # shared_expert_gate is (1, hidden_size) -> reshape to (1, hidden_size)
+        if loaded_weight.dim() == 1:
+            loaded_weight = loaded_weight.unsqueeze(0)
+        param_data[layer_id] = loaded_weight
+
+    def shared_gate_up_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
+                                      weight_name: str, layer_id: int):
+        tp_rank = get_tensor_model_parallel_rank()
+        param_data = param.data
+        shard_size = param_data.shape[1] // 2
+        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+
+        if "gate_proj" in weight_name:
+            param_data[layer_id, :shard_size, :] = loaded_weight[shard, :]
+        elif "up_proj" in weight_name:
+            param_data[layer_id, shard_size:, :] = loaded_weight[shard, :]
+
+    def shared_down_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, layer_id: int):
+        tp_rank = get_tensor_model_parallel_rank()
+        param_data = param.data
+        shard_size = param_data.shape[2]
+        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        param_data[layer_id] = loaded_weight[:, shard]
+
+    def forward(self, index: int, hidden_states: torch.Tensor, experts_cache: torch.Tensor) -> torch.Tensor:
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+
+        # router_logits: (n_token, n_experts)
+        router_logits, _ = self.gates(index, hidden_states)
+
+        # Compute MoE output
+        moe_output = stack_fused_moe(
+            hidden_states,
+            self.ws.gpu_cache,
+            experts_cache,
+            router_logits,
+            self.top_k,
+            renormalize=self.renormalize,
+            inplace=True
+        )
+
+        # Add shared expert output if present
+        if self.shared_gate_up is not None:
+            # Compute shared expert
+            gate_up = torch.nn.functional.linear(hidden_states, self.shared_gate_up[index])
+            gate, up = gate_up.chunk(2, dim=-1)
+            shared_output = torch.nn.functional.silu(gate) * up
+            shared_output = torch.nn.functional.linear(shared_output, self.shared_down[index])
+
+            # Apply sigmoid gate
+            gate_value = torch.sigmoid(
+                torch.nn.functional.linear(hidden_states, self.shared_expert_gates[index])
+            )
+            shared_output = gate_value * shared_output
+
+            moe_output = moe_output + shared_output
+
+        if self.tp_size > 1:
+            moe_output = tensor_model_parallel_all_reduce(moe_output)
+
+        return moe_output.view(orig_shape)
+
+
+class Qwen2MoeAttention(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        layer_id: int = 0,
+        max_position: int = 32768,
+        rope_theta: float = 1000000.0,
+        linear_method: Optional[LinearMethodBase] = None,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= tp_size:
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim ** -0.5
+        self.rope_theta = rope_theta
+
+        # Qwen2MoE uses bias in QKV
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=True,
+            linear_method=linear_method,
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            linear_method=linear_method,
+        )
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            max_position,
+            is_neox_style=True,
+            rope_parameters={"rope_type": "default", "rope_theta": float(self.rope_theta)},
+        )
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+        if input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.PREATTN:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self.rotary_emb(positions, q, k)
+            if input_metadata.decode_part == DecodePart.PREATTN:
+                return torch.cat([q, k, v], dim=-1).contiguous()
+
+        if input_metadata.decode_part == DecodePart.ALL:
+            attn_output = self.attn(q, k, v, input_metadata)
+            input_metadata.attn_event.record(torch.cuda.current_stream())
+        if input_metadata.decode_part == DecodePart.CPU_ATTN:
+            attn_output = self.attn(None, None, None, input_metadata)
+            return attn_output
+
+        if input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.POSTATTN:
+            if input_metadata.decode_part == DecodePart.POSTATTN:
+                attn_output = hidden_states
+            output, _ = self.o_proj(attn_output)
+        return output
+
+
+class Qwen2MoeDecoderLayer(nn.Module):
+
+    def __init__(
+        self,
+        config: Qwen2MoeConfig,
+        layer_id: int = 0,
+        block_sparse_moe: Qwen2MoE = None,
+        linear_method: Optional[LinearMethodBase] = None,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.layer_id = layer_id
+        rope_theta = getattr(config, "rope_theta", 1000000.0)
+
+        self.self_attn = Qwen2MoeAttention(
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            layer_id=layer_id,
+            max_position=config.max_position_embeddings,
+            num_kv_heads=config.num_key_value_heads,
+            rope_theta=rope_theta,
+            linear_method=linear_method,
+        )
+        self.block_sparse_moe = block_sparse_moe
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        input_metadata: InputMetadata,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.PREATTN:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        if input_metadata.decode_part == DecodePart.PREATTN:
+            qkv = self.self_attn(positions, hidden_states, input_metadata)
+            return qkv, residual
+        elif input_metadata.decode_part == DecodePart.CPU_ATTN:
+            attn_out = self.self_attn(positions, hidden_states, input_metadata)
+            return attn_out
+        elif input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.POSTATTN:
+            # Self Attention
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                input_metadata=input_metadata,
+            )
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states = self.block_sparse_moe(self.layer_id, hidden_states, input_metadata.experts_mapping)
+
+        return hidden_states, residual
+
+
+class Qwen2MoeModel(nn.Module):
+
+    def __init__(
+        self,
+        config: Qwen2MoeConfig,
+        linear_method: Optional[LinearMethodBase] = None,
+        offload_device: str = "cpu",
+    ) -> None:
+        super().__init__()
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.org_vocab_size = config.vocab_size
+
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+        )
+        self.tp_size = get_tensor_model_parallel_world_size()
+
+        # Initialize the MoE block (shared across all layers)
+        self.block_sparse_moe = Qwen2MoE(
+            num_layers=config.num_hidden_layers,
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            shared_expert_intermediate_size=getattr(config, "shared_expert_intermediate_size", 0),
+            renormalize=getattr(config, "norm_topk_prob", False),
+            offload_device=offload_device,
+        )
+
+        self.layers = nn.ModuleList([
+            Qwen2MoeDecoderLayer(
+                config,
+                i,
+                block_sparse_moe=self.block_sparse_moe,
+                linear_method=linear_method
+            )
+            for i in range(config.num_hidden_layers)
+        ])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_metadata: InputMetadata,
+        hidden_states: torch.Tensor = None,
+        residual: torch.Tensor = None,
+        cur_layers: List[int] = None,
+    ) -> torch.Tensor:
+        if hidden_states is None and input_ids is not None:
+            hidden_states = self.embed_tokens(input_ids)
+            residual = None
+        if cur_layers is None:
+            cur_layers = range(len(self.layers))
+        for i in cur_layers:
+            layer = self.layers[i]
+            if input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.POSTATTN:
+                hidden_states, residual = layer(positions, hidden_states, input_metadata, residual)
+            elif input_metadata.decode_part == DecodePart.PREATTN:
+                qkv, residual = layer(positions, hidden_states, input_metadata, residual)
+                return qkv, residual
+            elif input_metadata.decode_part == DecodePart.CPU_ATTN:
+                attn_out = layer(None, None, input_metadata, None)
+                return attn_out
+        if cur_layers[-1] != len(self.layers) - 1:
+            return hidden_states, residual
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
+            return hidden_states, _
+
+
+class Qwen2MoeForCausalLMOff(nn.Module):
+
+    def __init__(
+        self,
+        config: Qwen2MoeConfig,
+        linear_method: Optional[LinearMethodBase] = None,
+        offload_device: str = "cpu",
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.linear_method = linear_method
+        self.offload_device = offload_device
+        self.model = Qwen2MoeModel(config, linear_method, offload_device=offload_device)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.logits_processor = LogitsProcessor(config)
+        self.tp_size = get_tensor_model_parallel_world_size()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_metadata: InputMetadata,
+        hidden_states: torch.Tensor = None,
+        residual: torch.Tensor = None,
+        cur_layers: List[int] = None,
+    ) -> torch.Tensor:
+        if input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.POSTATTN:
+            if hidden_states is not None:
+                hidden_states = hidden_states.view(hidden_states.shape[0], -1)
+            hidden_states, residual = self.model(
+                input_ids, positions, input_metadata,
+                hidden_states=hidden_states, residual=residual, cur_layers=cur_layers
+            )
+        elif input_metadata.decode_part == DecodePart.PREATTN:
+            qkv, residual = self.model(
+                input_ids, positions, input_metadata,
+                hidden_states=hidden_states, residual=residual, cur_layers=cur_layers
+            )
+            return qkv, residual
+        elif input_metadata.decode_part == DecodePart.CPU_ATTN:
+            attn_out = self.model(
+                input_ids, positions, input_metadata,
+                hidden_states=hidden_states, residual=residual, cur_layers=cur_layers
+            )
+            return attn_out
+        if self.config.num_hidden_layers - 1 not in cur_layers:
+            return hidden_states, residual
+        else:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head.weight, input_metadata
+            )
+
+    def load_weights(
+        self,
+        model_name_or_path: str,
+        cache_dir: Optional[str] = None,
+        load_format: str = "auto",
+        revision: Optional[str] = None
+    ):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+        ]
+
+        # Expert params mapping
+        expert_params_mapping = [
+            # (param_name, weight_name, expert_id, layer_id)
+            (
+                "block_sparse_moe.ws",
+                f"layers.{layer_id}.mlp.experts.{expert_id}.{weight_name}.weight",
+                expert_id,
+                layer_id
+            )
+            for expert_id in range(self.config.num_experts)
+            for weight_name in ["gate_proj", "up_proj", "down_proj"]
+            for layer_id in range(self.config.num_hidden_layers)
+        ]
+
+        # Gate params mapping
+        gate_params_mapping = [
+            # (param_name, weight_name, layer_id)
+            (
+                "block_sparse_moe.gates.weight",
+                f"layers.{layer_id}.mlp.gate.weight",
+                layer_id
+            )
+            for layer_id in range(self.config.num_hidden_layers)
+        ]
+
+        # Shared expert params mapping
+        shared_expert_params_mapping = []
+        if getattr(self.config, "shared_expert_intermediate_size", 0) > 0:
+            for layer_id in range(self.config.num_hidden_layers):
+                # Shared expert gate
+                shared_expert_params_mapping.append((
+                    "block_sparse_moe.shared_expert_gates",
+                    f"layers.{layer_id}.mlp.shared_expert_gate.weight",
+                    layer_id,
+                    "gate"
+                ))
+                # Shared expert MLP
+                for weight_name in ["gate_proj", "up_proj"]:
+                    shared_expert_params_mapping.append((
+                        "block_sparse_moe.shared_gate_up",
+                        f"layers.{layer_id}.mlp.shared_expert.{weight_name}.weight",
+                        layer_id,
+                        weight_name
+                    ))
+                shared_expert_params_mapping.append((
+                    "block_sparse_moe.shared_down",
+                    f"layers.{layer_id}.mlp.shared_expert.down_proj.weight",
+                    layer_id,
+                    "down"
+                ))
+
+        params_dict = dict(self.named_parameters())
+
+        for name, loaded_weight in tqdm(hf_model_weights_iterator(
+                model_name_or_path,
+                cache_dir,
+                load_format,
+                revision,
+                fall_back_to_pt=False)):
+
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            # Handle gate params
+            for (param_name, weight_name, layer_id) in gate_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, layer_id)
+                break
+            else:
+                # Handle shared expert params
+                matched_shared = False
+                for mapping in shared_expert_params_mapping:
+                    param_name, weight_name, layer_id, proj_type = mapping
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    if proj_type == "gate":
+                        weight_loader(param, loaded_weight, layer_id)
+                    elif proj_type in ["gate_proj", "up_proj"]:
+                        weight_loader(param, loaded_weight, proj_type, layer_id)
+                    elif proj_type == "down":
+                        weight_loader(param, loaded_weight, layer_id)
+                    matched_shared = True
+                    break
+
+                if matched_shared:
+                    continue
+
+                # Handle QKV stacked params
+                for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    break
+                else:
+                    # Handle expert params
+                    for param_name, weight_name, expert_id, layer_id in expert_params_mapping:
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            weight_name,
+                            expert_id=expert_id,
+                            layer_id=layer_id
+                        )
+                        break
+                    else:
+                        # Handle remaining params (embeddings, layernorms, etc.)
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, loaded_weight)
+
+    def get_experts_mem(self):
+        return self.model.block_sparse_moe.ws.data
+
+    def link_gpu_experts_cache(self, expert_pool):
+        set_weight_attrs(self.model.block_sparse_moe.ws, {"gpu_cache": expert_pool})
+
+
+EntryClass = Qwen2MoeForCausalLMOff

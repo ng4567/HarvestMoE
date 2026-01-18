@@ -13,11 +13,12 @@ from fastmoe.backend.model_runner import ModelRunner
 
 
 class ExecutionEngine:
-    def __init__(self, model_runner: ModelRunner, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int):
+    def __init__(self, model_runner: ModelRunner, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int, offload_device: str = "cpu", wg_override: float = None):
         self.model_runner = model_runner
         self.model_config = model_config
         self.hardware_config = hardware_config
-        self.context = ExecutionContext.build_context(model_config, hardware_config, avg_prompt_len, gen_len)
+        self.offload_device = offload_device
+        self.context = ExecutionContext.build_context(model_config, hardware_config, avg_prompt_len, gen_len, offload_device, wg_override)
         self.micro_batches: List[Batch] = None
 
         # sync primititves
@@ -155,7 +156,14 @@ class ExecutionEngine:
         # self.num_weights_slots_decode = len(micro_batches)
         self.micro_batches = micro_batches
 
-        self.prefetch_events = [torch.cuda.Event() for _ in range(len(micro_batches))]
+        # Pre-record events so first wait() doesn't deadlock on unrecorded events
+        # This is especially important for GPU-to-GPU offloading where CUDA event waits are used
+        self.prefetch_events = []
+        for _ in range(len(micro_batches)):
+            event = torch.cuda.Event()
+            event.record()  # Record on current stream so first wait() passes
+            self.prefetch_events.append(event)
+        
         self.attn_events = [torch.cuda.Event() for _ in range(len(micro_batches))]
         self.compute_events = [torch.cuda.Event() for _ in range(len(micro_batches))]
         self.prefill_load_hidden_events = [torch.cuda.Event() for _ in range(len(micro_batches))]
@@ -190,8 +198,14 @@ class ExecutionEngine:
                 self.context.experts_cache[prefetch_gpu_slice].copy_(self.model_runner.model.get_experts_mem()[layer_id, prefetch_cpu_slice], non_blocking=True)
                 self.prefetch_events[slot_id].record(self.context.prefetch_stream)
         elif stage == 'decode':
-            # wait on copy to pin
-            self.copy_futures[slot_id].result()
+            # Wait for the copy to relay buffer to complete
+            if self.context.offload_device != "cpu":
+                # GPU offloading: wait on CUDA event from peer GPU stream
+                self.context.peer_copy_events[slot_id].wait(self.context.load_stream)
+            else:
+                # CPU offloading: wait on thread executor future
+                self.copy_futures[slot_id].result()
+            
             assert(slot_id < self.num_weights_slots_decode) 
             prefetch_gpu_slice = self._get_prefetch_gpu_slice(slot_id, stage)
             if slot_id != self.num_weights_slots_decode - 1:
@@ -210,9 +224,44 @@ class ExecutionEngine:
                 self.prefetch_events[slot_id].record(self.context.prefetch_stream)
     
     def prefetch_experts_to_pin(self, layer_id: int, slot_id: int):
-        self.copy_futures[slot_id] = self.context.copy_executor.submit(self.prefetch_experts_to_pin_func, layer_id, slot_id)
+        # For GPU-to-GPU offloading, use CUDA streams directly instead of CPU thread executor
+        if self.context.offload_device != "cpu":
+            self._prefetch_experts_to_pin_gpu(layer_id, slot_id)
+        else:
+            # CPU offloading: use thread executor for async CPU copy
+            self.copy_futures[slot_id] = self.context.copy_executor.submit(self.prefetch_experts_to_pin_func, layer_id, slot_id)
+
+    def _prefetch_experts_to_pin_gpu(self, layer_id: int, slot_id: int):
+        """GPU-to-GPU path: use CUDA stream on peer GPU for async transfer."""
+        intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
+        experts_pin = self.context.experts_pin.view(-1, intermediate_size)
+        experts_offload = (self.model_runner.model.get_experts_mem()
+                           .view(self.model_config.num_hidden_layers, 
+                                -1, 
+                                intermediate_size))
+        prefetch_slice = self._get_prefetch_cpu_slice(slot_id, 'decode')
+        if slot_id != self.num_weights_slots_decode - 1:
+            to_pin_slice = slice(
+                slot_id * self.decode_slot_size, 
+                (slot_id + 1) * self.decode_slot_size
+            )
+        else:
+            to_pin_slice = slice(
+                slot_id * self.decode_slot_size, 
+                None
+            )
+
+        # For GPU-to-GPU: ensure main GPU stream is done before we copy
+        # Use full synchronization to avoid cross-device event issues
+        torch.cuda.synchronize()
+        
+        # Do the copy on the peer GPU stream
+        with torch.cuda.stream(self.context.peer_gpu_stream):
+            experts_pin[to_pin_slice, :].copy_(experts_offload[layer_id, prefetch_slice, :], non_blocking=True)
+            self.context.peer_copy_events[slot_id].record(self.context.peer_gpu_stream)
 
     def prefetch_experts_to_pin_func(self, layer_id: int, slot_id: int):
+        """CPU offloading path: runs on thread executor for async CPU-to-pinned-memory copy."""
         self.prefetch_events[slot_id].synchronize()
         
         intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
@@ -453,7 +502,7 @@ class ExecutionContext:
     # experts cache on gpu
     experts_cache: torch.tensor
 
-    # cpu pinned relay
+    # cpu pinned relay (or peer GPU buffer for GPU-to-GPU offloading)
     qkv_pin: List[torch.tensor]
     hidden_pin: List[torch.tensor]
     experts_pin: torch.tensor
@@ -472,8 +521,15 @@ class ExecutionContext:
     avg_prompt_tokens: int
     gen_len: int
     
+    # offload device configuration
+    offload_device: str = "cpu"
+    
+    # For GPU-to-GPU offloading: stream on peer GPU and events for synchronization
+    peer_gpu_stream: torch.cuda.stream = None
+    peer_copy_events: List[torch.cuda.Event] = None
+    
     @classmethod
-    def build_context(cls, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int):
+    def build_context(cls, model_config: ModelConfig, hardware_config: HardwareConfig, avg_prompt_len: int, gen_len: int, offload_device: str = "cpu", wg_override: float = None):
         avg_prompt_tokens = avg_prompt_len
         max_new_tokens = gen_len
 
@@ -486,7 +542,34 @@ class ExecutionContext:
         opt_args['num_gb'] = None
         
         policy, _ = solve(model_config, hardware_config, opt_args)
-        print(f"Policy: {policy}")
+        print(f"Policy (LP-computed): {policy}")
+        
+        # Apply wg_override if specified
+        if wg_override is not None:
+            if not (0.0 <= wg_override <= 1.0):
+                raise ValueError(f"wg_override must be between 0.0 and 1.0, got {wg_override}")
+            old_wg = policy.wg
+            policy.wg = wg_override
+            policy.wc = 1.0 - wg_override
+            num_experts_gpu = int(model_config.num_local_experts * wg_override)
+            print(f"wg_override applied: wg {old_wg:.4f} -> {wg_override:.4f} ({num_experts_gpu}/{model_config.num_local_experts} experts on GPU)")
+        
+        print(f"Policy (final): {policy}")
+        print(f"Offload device: {offload_device}")
+        
+        # Debug summary of expert offloading configuration
+        num_experts_on_gpu = int(model_config.num_local_experts * policy.wg)
+        num_experts_offloaded = model_config.num_local_experts - num_experts_on_gpu
+        print("=" * 60)
+        print("EXPERT OFFLOADING CONFIG SUMMARY")
+        print("=" * 60)
+        print(f"  Total experts:      {model_config.num_local_experts}")
+        print(f"  Experts on GPU:     {num_experts_on_gpu} ({policy.wg * 100:.1f}%)")
+        print(f"  Experts offloaded:  {num_experts_offloaded} ({policy.wc * 100:.1f}%)")
+        print(f"  Offload device:     {offload_device}")
+        print(f"  wg_override used:   {wg_override is not None}")
+        print("=" * 60)
+        
         # # hack
         # policy.ubs = 8
         # policy.n_ub = 39
@@ -500,9 +583,9 @@ class ExecutionContext:
         token_to_kv_pool = TokenToKVPool(
             gpu_token_buffer_size,
             cpu_token_pool_size,
-            dtype=torch.get_default_dtype(),
+            dtype=torch.bfloat16,
             head_num = model_config.num_key_value_heads // hardware_config.tp_size,
-            head_dim = model_config.hidden_size // model_config.num_attention_heads,
+            head_dim = model_config.head_dim,
             layer_num = model_config.num_hidden_layers,
         )
 
@@ -517,20 +600,29 @@ class ExecutionContext:
         # elif we do not have enough GPU memory, the buffer is of size 2 * num_comp_experts
         experts_pool_size  = num_layers * num_experts_gpu + 2 * (num_comp_experts - num_experts_gpu)
         intermediate_size = model_config.intermediate_size // hardware_config.tp_size
-        experts_cache = torch.empty(experts_pool_size, 3 * intermediate_size * model_config.hidden_size, dtype=torch.get_default_dtype(), device="cuda")
+        experts_cache = torch.empty(experts_pool_size, 3 * intermediate_size * model_config.hidden_size, dtype=torch.bfloat16, device="cuda")
 
-        experts_pin = torch.empty(((num_comp_experts - num_experts_gpu), 
-                                    3 * intermediate_size * model_config.hidden_size), 
-                                    dtype=torch.get_default_dtype(), device="cpu").pin_memory()
+        # Allocate experts relay buffer based on offload device
+        # For CPU offloading: use pinned memory for async CPU-GPU transfer
+        # For peer GPU offloading: allocate on the peer GPU for GPU-GPU P2P transfer
+        if offload_device == "cpu":
+            experts_pin = torch.empty(((num_comp_experts - num_experts_gpu), 
+                                        3 * intermediate_size * model_config.hidden_size), 
+                                        dtype=torch.bfloat16, device="cpu").pin_memory()
+        else:
+            # For peer GPU offloading, allocate buffer on the peer GPU
+            experts_pin = torch.empty(((num_comp_experts - num_experts_gpu), 
+                                        3 * intermediate_size * model_config.hidden_size), 
+                                        dtype=torch.bfloat16, device=offload_device)
 
         num_q_heads = model_config.num_attention_heads // hardware_config.tp_size
         n_kv_heads = model_config.num_key_value_heads // hardware_config.tp_size
-        head_dim = model_config.hidden_size // model_config.num_attention_heads
+        head_dim = model_config.head_dim
         qkv_pin = [torch.empty(ubs, (num_q_heads + 2 * n_kv_heads) * head_dim, 
-                              dtype=torch.get_default_dtype(), device="cpu").pin_memory() for _ in range(policy.n_ub)]
+                              dtype=torch.bfloat16, device="cpu").pin_memory() for _ in range(policy.n_ub)]
 
         hidden_pin = [torch.empty(ubs, 1, num_q_heads, head_dim,
-                                 dtype=torch.get_default_dtype(), device="cpu").pin_memory() for _ in range(policy.n_ub)]
+                                 dtype=torch.bfloat16, device="cpu").pin_memory() for _ in range(policy.n_ub)]
 
         #  gpu memory usage
         free_gpu_memory, _ = torch.cuda.mem_get_info()
@@ -548,7 +640,20 @@ class ExecutionContext:
         cur_stream = torch.cuda.current_stream()
         offload_kv_events = [torch.cuda.Event() for _ in range(2)]
         
-
+        # For GPU-to-GPU offloading: create stream on peer GPU and events for synchronization
+        peer_gpu_stream = None
+        peer_copy_events = None
+        if offload_device != "cpu":
+            # Create a stream on the peer GPU for async P2P transfers
+            with torch.cuda.device(offload_device):
+                peer_gpu_stream = torch.cuda.Stream()
+            # Events for synchronizing peer GPU copies (one per micro-batch slot)
+            # Pre-record events so the first wait() doesn't deadlock on unrecorded events
+            peer_copy_events = []
+            for _ in range(policy.n_ub):
+                event = torch.cuda.Event()
+                event.record(peer_gpu_stream)  # Record immediately so first wait() passes
+                peer_copy_events.append(event)
 
         return cls(model_config=model_config,
                    policy=policy,
@@ -565,7 +670,10 @@ class ExecutionContext:
                    cur_stream=cur_stream,
                    offload_kv_events=offload_kv_events,
                    avg_prompt_tokens=avg_prompt_tokens,
-                   gen_len=max_new_tokens)
+                   gen_len=max_new_tokens,
+                   offload_device=offload_device,
+                   peer_gpu_stream=peer_gpu_stream,
+                   peer_copy_events=peer_copy_events)
 
     def init_gpu_experts(self, cpu_experts_mem):
         num_gpu_experts = int(self.model_config.num_local_experts * self.policy.wg)

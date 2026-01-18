@@ -77,6 +77,7 @@ class DbrxExperts(nn.Module):
         self,
         config: DbrxConfig,
         params_dtype: Optional[torch.dtype] = None,
+        offload_device: str = "cpu",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -86,6 +87,7 @@ class DbrxExperts(nn.Module):
         self.hidden_size = config.d_model
         self.intermediate_size = (config.ffn_config.ffn_hidden_size //
                                   self.tp_size)
+        self.offload_device = offload_device
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -96,7 +98,7 @@ class DbrxExperts(nn.Module):
         self.ws = nn.Parameter(
             torch.empty(self.num_layers, self.num_total_experts,
                         3 * self.intermediate_size * self.hidden_size,
-                        device="cpu",
+                        device=self.offload_device,
                         dtype=self.params_dtype))
 
         set_weight_attrs(
@@ -189,10 +191,9 @@ class DbrxAttention(nn.Module):
         )
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=self.max_position,
-            rope_parameters={"rope_type": "default", "rope_theta": float(self.rope_theta)},
+            self.max_position,
             is_neox_style=True,
+            rope_parameters={"rope_type": "default", "rope_theta": float(self.rope_theta)},
         )
 
         tp_world_size = get_tensor_model_parallel_world_size()
@@ -348,13 +349,14 @@ class DbrxModel(nn.Module):
         self,
         config: DbrxConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        offload_device: str = "cpu",
     ):
         super().__init__()
         self.wte = VocabParallelEmbedding(
             config.vocab_size,
             config.d_model,
         )
-        self.dbrx_experts = DbrxExperts(config)
+        self.dbrx_experts = DbrxExperts(config, offload_device=offload_device)
         self.blocks = nn.ModuleList(
             [DbrxBlock(config, i, dbrx_experts=self.dbrx_experts, linear_method=linear_method) for i in range(config.n_layers)])
         self.norm_f = nn.LayerNorm(config.d_model, eps=1e-5)
@@ -404,12 +406,14 @@ class DbrxForCausalLMOff(nn.Module):
         self,
         config: DbrxConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        offload_device: str = "cpu",
     ):
         super().__init__()
         self.config = config
         self.linear_method = linear_method
+        self.offload_device = offload_device
         self.unpadded_vocab_size = config.vocab_size
-        self.transformer = DbrxModel(config, linear_method)
+        self.transformer = DbrxModel(config, linear_method, offload_device=offload_device)
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.d_model,

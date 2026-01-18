@@ -68,6 +68,7 @@ class ModelRunner:
         nccl_port,
         load_format="auto",
         trust_remote_code=True,
+        offload_device="cpu",
     ):
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
@@ -77,6 +78,7 @@ class ModelRunner:
         self.load_format = load_format
         self.trust_remote_code = trust_remote_code
         self.offload = True
+        self.offload_device = offload_device
 
         # Init torch distributed
         torch.cuda.set_device(self.tp_rank)
@@ -112,13 +114,16 @@ class ModelRunner:
         architectures = getattr(self.model_config.hf_config, "architectures", [])
         model_class = get_model_cls_by_arch_name(architectures, self.offload)
         logger.info(f"Rank {self.tp_rank}: load weight begin.")
+        logger.info(f"Rank {self.tp_rank}: offload_device={self.offload_device}")
 
         # Load weights
         linear_method = None
-        with _set_default_torch_dtype(torch.float16):
+        with _set_default_torch_dtype(torch.bfloat16):
             with torch.device("cuda"):
                 model = model_class(
-                    config=self.model_config.hf_config, linear_method=linear_method
+                    config=self.model_config.hf_config, 
+                    linear_method=linear_method,
+                    offload_device=self.offload_device,
                 )
             model.load_weights(
                 self.model_config.path,

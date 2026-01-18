@@ -48,6 +48,7 @@ class MixtralMoE(nn.Module):
         intermediate_size: int,
         params_dtype: Optional[torch.dtype] = None,
         tp_size: Optional[int] = None,
+        offload_device: str = "cpu",
     ):
         super().__init__()
         self.tp_size = tp_size or get_tensor_model_parallel_world_size()
@@ -56,6 +57,7 @@ class MixtralMoE(nn.Module):
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size // self.tp_size
+        self.offload_device = offload_device
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -71,7 +73,7 @@ class MixtralMoE(nn.Module):
         self.ws = nn.Parameter(
             torch.empty(self.num_layers, self.num_total_experts,
                         3 * self.intermediate_size * self.hidden_size,
-                        device="cpu",
+                        device=self.offload_device,
                         dtype=self.params_dtype))
 
         set_weight_attrs(self.ws, {
@@ -162,10 +164,9 @@ class MixtralAttention(nn.Module):
         )
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position,
-            rope_parameters={"rope_type": "default", "rope_theta": float(self.rope_theta)},
+            max_position,
             is_neox_style=True,
+            rope_parameters={"rope_type": "default", "rope_theta": float(self.rope_theta)},
         )
         self.attn = Attention(
             self.num_heads,
@@ -273,6 +274,7 @@ class MixtralModel(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        offload_device: str = "cpu",
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -291,7 +293,9 @@ class MixtralModel(nn.Module):
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size)
+            intermediate_size=config.intermediate_size,
+            offload_device=offload_device,
+        )
         self.layers = nn.ModuleList([
             MixtralDecoderLayer(config, i, block_sparse_moe=self.block_sparse_moe, linear_method=linear_method)
             for i in range(config.num_hidden_layers)
@@ -339,11 +343,13 @@ class MixtralForCausalLMOff(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        offload_device: str = "cpu",
     ) -> None:
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.model = MixtralModel(config, linear_method)
+        self.offload_device = offload_device
+        self.model = MixtralModel(config, linear_method, offload_device=offload_device)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
         self.tp_size = get_tensor_model_parallel_world_size()

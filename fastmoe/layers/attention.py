@@ -55,16 +55,30 @@ class Attention(nn.Module):
 
         self.store_kv_cache_cpu(k, v, input_metadata)
         
-        # print("query:", query[:6, 0, :2, :2], "layer:", self.layer_id)
+        # CPU kernel doesn't support bfloat16, convert to float16 for computation
+        original_dtype = query.dtype
+        if original_dtype == torch.bfloat16:
+            query = query.to(torch.float16)
+            key_buffer = input_metadata.token_to_kv_pool.get_key_buffer_cpu(self.layer_id).to(torch.float16)
+            value_buffer = input_metadata.token_to_kv_pool.get_value_buffer_cpu(self.layer_id).to(torch.float16)
+            hidden_pin = input_metadata.hidden_pin.to(torch.float16)
+        else:
+            key_buffer = input_metadata.token_to_kv_pool.get_key_buffer_cpu(self.layer_id)
+            value_buffer = input_metadata.token_to_kv_pool.get_value_buffer_cpu(self.layer_id)
+            hidden_pin = input_metadata.hidden_pin
+        
         token_attention_cpu(
-            input_metadata.hidden_pin, query, 
-            input_metadata.token_to_kv_pool.get_key_buffer_cpu(self.layer_id), 
-            input_metadata.token_to_kv_pool.get_value_buffer_cpu(self.layer_id), 
+            hidden_pin, query, 
+            key_buffer, 
+            value_buffer, 
             input_metadata.seq_lens, 
             input_metadata.start_loc, 
             self.head_dim**-0.5
         )
-        # print("hidden_pin:", input_metadata.hidden_pin[:6, 0, :2, :2])
+        
+        # Convert back to original dtype if needed
+        if original_dtype == torch.bfloat16:
+            input_metadata.hidden_pin.copy_(hidden_pin.to(torch.bfloat16))
 
         return
     

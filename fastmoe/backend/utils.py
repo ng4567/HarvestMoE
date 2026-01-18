@@ -57,8 +57,29 @@ class HardwareConfig:
                 cpu_flops=0.8 * T,
                 tp_size=tp_size
             )
+        elif "H100" in gpu_device_name:
+            return cls(
+                gmem=93 * GB,  # H100 NVL has ~93GB available memory (measured)
+                cmem=cpu_mem * GB,
+                ctog_bdw=24 * GB,  # H100 has high PCIe 5.0/NVLink bandwidth
+                g_bdw=3350 * GB,  # Measured ~3320-3397 GB/s, using 3350 GB/s
+                c_bdw=c_bdw * GB,
+                gpu_flops=450 * T,  # Measured ~400-472 TFLOPS sustained performance
+                cpu_flops=1.6 * T,  # Conservative CPU estimate
+                tp_size=tp_size
+            )
         else:
-            return cls
+            # Default fallback - still create an instance with tp_size!
+            return cls(
+                gmem=24 * GB,
+                cmem=cpu_mem * GB,
+                ctog_bdw=16 * GB,
+                g_bdw=300 * GB,
+                c_bdw=c_bdw * GB,
+                gpu_flops=104 * T,
+                cpu_flops=13 * T,
+                tp_size=tp_size
+            )
 
 @dataclasses.dataclass
 class CostModelConfig:
