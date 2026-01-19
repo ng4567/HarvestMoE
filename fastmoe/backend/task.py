@@ -126,6 +126,10 @@ class Batch:
         self.seq_lens.add_(1)
         self.decode_out_cache_loc.add_(1)
         self.seq_lens_cpu = (self.seq_lens).to("cpu")
+        # Reset hidden_states and residual for the start of decode
+        # This ensures the model computes embedding from the new input_ids
+        self.hidden_states = None
+        self.residual = None
 
     
     def prepare_for_prefill(self, token_to_kv_pool: TokenToKVPool, vocab_size: int, int_token_logit_bias: torch.Tensor, max_output_len: int):

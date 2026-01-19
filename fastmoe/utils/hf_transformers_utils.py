@@ -82,6 +82,25 @@ TOPK_KEYS = [
     "moe_top_k",
 ]
 
+HEAD_DIM_KEYS = [
+    "head_dim",
+]
+
+
+def get_head_dim(config):
+    """Get the head dimension from config, or calculate from hidden_size/num_attention_heads."""
+    # First check for explicit head_dim in config (e.g., Phi-tiny-MoE)
+    for key in HEAD_DIM_KEYS:
+        val = getattr(config, key, None)
+        if val is not None:
+            return val
+    # Fall back to calculating from hidden_size and num_attention_heads
+    hidden_size = get_hidden_size(config)
+    num_heads = get_num_attention_heads(config)
+    if hidden_size and num_heads:
+        return hidden_size // num_heads
+    return None
+
 
 def get_context_length(config):
     """Get the context length of a model from a huggingface model config."""

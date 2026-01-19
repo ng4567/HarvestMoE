@@ -48,19 +48,30 @@ def import_model_classes():
     return model_arch_name_to_cls
 
 
-def get_model_cls_by_arch_name(model_arch_names, offload):
+def get_model_cls_by_arch_name(model_arch_names, offload, model_path=None):
     model_arch_name_to_cls = import_model_classes()
+
+    # Check for specific model variants based on model path
+    # This allows distinguishing between models with the same architecture
+    if model_path:
+        model_path_lower = model_path.lower()
+        
+        # Phi-tiny-MoE uses a specialized implementation
+        if "phi-tiny" in model_path_lower or "phi_tiny" in model_path_lower:
+            if "PhiTinyMoEForCausalLMOff" in model_arch_name_to_cls:
+                logger.info(f"Using PhiTinyMoEForCausalLMOff for model: {model_path}")
+                return model_arch_name_to_cls["PhiTinyMoEForCausalLMOff"]
 
     model_class = None
     for arch in model_arch_names:
-        if offload:
-            arch += "Off"
-        if arch in model_arch_name_to_cls:
-            model_class = model_arch_name_to_cls[arch]
+        arch_name = arch + "Off" if offload else arch
+        if arch_name in model_arch_name_to_cls:
+            model_class = model_arch_name_to_cls[arch_name]
             break
-    else:
+    
+    if model_class is None:
         raise ValueError(
-            f"Unsupported architectures: {arch}. "
+            f"Unsupported architectures: {model_arch_names}. "
             f"Supported list: {list(model_arch_name_to_cls.keys())}"
         )
     return model_class
@@ -117,7 +128,7 @@ class ModelRunner:
         """See also vllm/model_executor/model_loader.py::get_model"""
         # Select model class
         architectures = getattr(self.model_config.hf_config, "architectures", [])
-        model_class = get_model_cls_by_arch_name(architectures, self.offload)
+        model_class = get_model_cls_by_arch_name(architectures, self.offload, self.model_config.path)
         logger.info(f"Rank {self.tp_rank}: load weight begin.")
 
         # Load weights

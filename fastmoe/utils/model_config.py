@@ -5,7 +5,8 @@ import torch
 from fastmoe.utils.hf_transformers_utils import (get_config, get_context_length, 
                                                 get_num_layers, get_hidden_size, 
                                                 get_num_attention_heads, get_num_kv_heads, 
-                                                get_intermediate_size, get_num_experts, get_topk)
+                                                get_intermediate_size, get_num_experts, get_topk,
+                                                get_head_dim)
 
 
 class ModelConfig:
@@ -22,7 +23,8 @@ class ModelConfig:
 
         # Unify the config keys for hf_config
         self.context_len = get_context_length(self.hf_config)
-        self.head_dim =  get_hidden_size(self.hf_config) // get_num_attention_heads(self.hf_config)
+        # Use explicit head_dim from config if available (e.g., Phi-tiny-MoE has head_dim=128)
+        self.head_dim = get_head_dim(self.hf_config)
         self.num_attention_heads = get_num_attention_heads(self.hf_config)
         self.num_key_value_heads = get_num_kv_heads(self.hf_config)
         if self.num_key_value_heads is None:

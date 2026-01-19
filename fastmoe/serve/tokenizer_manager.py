@@ -118,6 +118,9 @@ class TokenizerManager:
                 max_padding_length = obj.max_padding_length
                 self.tokenizer.pad_token = self.tokenizer.eos_token
                 rid = obj.rid
+                # Handle empty text
+                if not obj.text or (isinstance(obj.text, list) and len(obj.text) == 0):
+                    raise ValueError(f"Empty text received in batch request")
                 if max_padding_length == 0:
                     input_ids = self.tokenizer(obj.text).input_ids
                 else:

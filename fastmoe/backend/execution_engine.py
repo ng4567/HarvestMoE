@@ -502,7 +502,7 @@ class ExecutionContext:
             cpu_token_pool_size,
             dtype=torch.get_default_dtype(),
             head_num = model_config.num_key_value_heads // hardware_config.tp_size,
-            head_dim = model_config.hidden_size // model_config.num_attention_heads,
+            head_dim = model_config.head_dim,
             layer_num = model_config.num_hidden_layers,
         )
 
@@ -525,7 +525,7 @@ class ExecutionContext:
 
         num_q_heads = model_config.num_attention_heads // hardware_config.tp_size
         n_kv_heads = model_config.num_key_value_heads // hardware_config.tp_size
-        head_dim = model_config.hidden_size // model_config.num_attention_heads
+        head_dim = model_config.head_dim
         qkv_pin = [torch.empty(ubs, (num_q_heads + 2 * n_kv_heads) * head_dim, 
                               dtype=torch.get_default_dtype(), device="cpu").pin_memory() for _ in range(policy.n_ub)]
 
