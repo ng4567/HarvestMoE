@@ -35,9 +35,16 @@ logger = logging.getLogger("model_runner")
 def import_model_classes():
     model_arch_name_to_cls = {}
     for module_path in (Path(fastmoe.__file__).parent / "models").glob("*.py"):
-        module = importlib.import_module(f"fastmoe.models.{module_path.stem}")
-        if hasattr(module, "EntryClass"):
-            model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
+        try:
+            module = importlib.import_module(f"fastmoe.models.{module_path.stem}")
+            if hasattr(module, "EntryClass"):
+                model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
+        except Exception as exc:
+            logger.warning(
+                "Skipping model module %s due to import error: %s",
+                module_path.name,
+                exc,
+            )
     return model_arch_name_to_cls
 
 

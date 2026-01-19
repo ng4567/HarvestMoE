@@ -1,10 +1,13 @@
 from dataclasses import dataclass
 from enum import Enum, auto
+import logging
 from typing import List
 
 import numpy as np
 import torch
 from fastmoe.backend.memory import TokenToKVPool
+
+logger = logging.getLogger(__name__)
 
 class FinishReason(Enum):
     ABORT = auto()
@@ -219,7 +222,23 @@ class Batch:
         logits.div_(self.temperatures)
         logits.add_(self.logit_bias)
 
+        if not torch.isfinite(logits).all():
+            bad_count = (~torch.isfinite(logits)).sum().item()
+            logger.warning("Non-finite logits detected: %s values", bad_count)
+            logits = torch.nan_to_num(logits, nan=-1e4, posinf=1e4, neginf=-1e4)
+
         probs = torch.softmax(logits, dim=-1)
+        if not torch.isfinite(probs).all():
+            bad_count = (~torch.isfinite(probs)).sum().item()
+            logger.warning("Non-finite probs detected: %s values", bad_count)
+            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+            probs = probs.clamp_min(0.0)
+            row_sums = probs.sum(dim=-1, keepdim=True)
+            zero_rows = row_sums <= 0
+            if zero_rows.any():
+                probs[zero_rows] = 1.0 / probs.shape[-1]
+                row_sums = probs.sum(dim=-1, keepdim=True)
+            probs = probs / row_sums
         probs_sort, probs_idx = _top_p_top_k(probs, self.top_ps, self.top_ks)
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
         batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(
