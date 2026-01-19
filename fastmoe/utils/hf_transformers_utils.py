@@ -68,13 +68,15 @@ NUM_KV_HEADS_KEYS = [
 ]
 
 INTERMEDIATE_SIZE_KEYS = [
+    "moe_intermediate_size",  # Qwen2MoE uses this for expert intermediate size
     "intermediate_size",
     "ffn_hidden_size",
 ]
 
 NUM_EXPERTS_KEYS = [
     "moe_num_experts",
-    "num_local_experts"
+    "num_local_experts",
+    "num_experts",  # Qwen2MoE uses this
 ]
 
 TOPK_KEYS = [
