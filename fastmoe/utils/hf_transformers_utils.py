@@ -86,10 +86,12 @@ TOPK_KEYS = [
 def get_context_length(config):
     """Get the context length of a model from a huggingface model config."""
     rope_scaling = getattr(config, "rope_scaling", None)
+    rope_scaling_factor = 1
     if rope_scaling:
-        rope_scaling_factor = config.rope_scaling["factor"]
-    else:
-        rope_scaling_factor = 1
+        # Some models (e.g., Phi-3.5-MoE with longrope) don't have a "factor" key
+        # and instead use original_max_position_embeddings. In those cases,
+        # max_position_embeddings is already the extended context length.
+        rope_scaling_factor = rope_scaling.get("factor", 1)
 
     for key in CONTEXT_LENGTH_KEYS:
         val = getattr(config, key, None)
