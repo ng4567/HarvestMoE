@@ -20,6 +20,8 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_prefill_num_token: Optional[int] = None
     tp_size: int = 1
+    offload_device: str = "cpu"  # Device for expert weight offloading: "cpu" or "cuda:X" for peer GPU
+    wg_override: Optional[float] = None  # Override LP-computed wg (fraction of experts on GPU, 0.0-1.0)
     enable_expert_parallel: bool = False
     all2all_backend: Optional[str] = None
     schedule_conservativeness: float = 1.0
@@ -141,6 +143,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tp_size,
             help="Tensor parallelism degree.",
+        )
+        parser.add_argument(
+            "--offload-device",
+            type=str,
+            default=ServerArgs.offload_device,
+            help="Device for expert weight offloading. Use 'cpu' for CPU memory or 'cuda:X' for peer GPU (e.g., 'cuda:1').",
+        )
+        parser.add_argument(
+            "--wg-override",
+            type=float,
+            default=ServerArgs.wg_override,
+            help="Override the LP-computed expert GPU fraction (0.0=all experts offloaded, 1.0=all experts on GPU). "
+                 "For N experts, the number cached on GPU = int(N * wg_override), using floor.",
         )
         parser.add_argument(
             "--enable-expert-parallel",
